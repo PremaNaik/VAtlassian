@@ -1,0 +1,359 @@
+# Run `forge register` before the first deploy. Never reuse either source app ID.
+app:
+  id: ari:cloud:ecosystem::app/1ee40184-44e9-40a9-9552-1884c206c806
+  runtime:
+    name: nodejs22.x
+modules:
+  objectStore:
+    - key: fos
+      storageClass: standard
+  consumer:
+    - key: va-restore-consumer
+      queue: va-restore-queue
+      function: restore-worker
+    - key: va-vault-consumer
+      queue: va-vault-queue
+      function: vault-worker
+    - key: va-link-consumer
+      queue: va-link-queue
+      function: link-worker
+    - key: va-sprint-consumer
+      queue: va-sprint-queue
+      function: sprint-worker
+    - key: va-ci-intake-consumer
+      queue: va-ci-intake-queue
+      function: ci-intake-worker
+  sql:
+    - key: main
+      engine: mysql
+  llm:
+    - key: va-llm
+      model: [ claude ]
+  jira:issuePanel:
+    - key: va-panel
+      icon: https://developer.atlassian.com/platform/forge/images/issue-panel-icon.svg
+      resource: main-ui
+      resolver:
+        function: panel-resolver
+      title: VAtlassian
+    - key: va-test
+      icon: https://developer.atlassian.com/platform/forge/images/issue-panel-icon.svg
+      resource: main-ui
+      resolver:
+        function: test-resolver
+      title: Test management
+  jira:issueContext:
+    - key: va-context
+      resource: main-ui
+      resolver:
+        function: panel-resolver
+      title: VAtlassian
+      label: Baseline status
+      dynamicProperties:
+        function: issue-status
+  jira:globalPage:
+    - key: va-worklist
+      resource: main-ui
+      resolver:
+        function: panel-resolver
+      title: My approvals
+      layout: blank
+  # Sprint readiness (src/lib/sprintReadiness.js): a sprint item is ready only
+  # when its whole tree is baselined and has no undecided drift. "Check
+  # readiness" only reports; "Sign and start sprint" starts the sprint, signed,
+  # only when every tree is ready; "Sign and complete sprint" closes a running
+  # one, signed (src/lib/sprintStart.js). Jira's own buttons are taken away by
+  # granting "Manage sprints" only to the app's role.
+  jira:sprintAction:
+    - key: va-sprint-readiness
+      resource: main-ui
+      resolver:
+        function: sprint-resolver
+      title: Start Sprint
+      viewportSize: large
+  jira:personalSettingsPage:
+    - key: va-authenticator
+      resource: main-ui
+      resolver:
+        function: totp-resolver
+      title: VAtlassian authenticator
+  jira:workflowValidator:
+    - key: va-gate
+      name: VAtlassian Approval
+      # Attach this validator to every transition. It holds baselined items with
+      # unreviewed changes until approval or restore. It requires a signature
+      # only on transitions configured in VAtlassian administration.
+      # No second Jira rule is needed. See src/gate.js.
+      description: Attach to every transition. Holds a work item with unreviewed
+        changes since approval, and requires an eligible approval at the
+        configured assurance level on transitions VAtlassian controls.
+      function: gate
+      projectTypes: [ company-managed ]
+      configurationDescription:
+        expression: "'VAtlassian approval: ' + (config['configuredIn'] == 'admin' ?
+          'Configured in VAtlassian' : 'Holds drifted work items; signature
+          rules are set in VAtlassian administration')"
+      resolver:
+        function: admin-resolver
+      create:
+        resource: main-ui
+      edit:
+        resource: main-ui
+      view:
+        resource: main-ui
+  jira:customField:
+    # Both fields mount frontend/src/field/ApprovalField.tsx. The exact
+    # transition rule selects an authenticator code or device-check window.
+    # Custom UI supports WebAuthn; UI Kit has no navigator for that check.
+    - key: va-approval-field
+      name: Electronic signature
+      description: The VAtlassian signing form for a controlled transition. Put it on
+        the transition screen; it asks for an authenticator code or a device
+        check, whichever the rule requires.
+      type: string
+      resolver:
+        function: panel-resolver
+      view:
+        resource: ui-kit-approval-view
+        render: native
+        experience: [ issue-view ]
+        formatter:
+          expression: "value == null || value == '' ? 'Not approved' : 'Approval recorded
+            — see the VAtlassian panel'"
+          export: true
+      edit:
+        resource: main-ui
+        experience: [ issue-transition ]
+
+    # Retired field. The former "Biometric Authentication" field. It stays registered
+    # so the receipts stored in it, and screens that still carry it, keep
+    # working; it shows exactly the same form as the field above. Swap it for
+    # "Electronic signature" on transition screens, then remove this module.
+    - key: va-device-approval-field
+      name: Electronic signature (retired)
+      description: Replaced by Electronic signature, which shows the same form. Remove
+        this field from transition screens.
+      type: string
+      resolver:
+        function: panel-resolver
+      view:
+        resource: ui-kit-approval-view
+        render: native
+        experience: [ issue-view ]
+        formatter:
+          expression: "value == null || value == '' ? 'Not approved' : 'Approval recorded
+            — see the VAtlassian panel'"
+          export: true
+      edit:
+        resource: main-ui
+        experience: [ issue-transition ]
+  jira:adminPage:
+    - key: va-admin
+      resource: main-ui
+      resolver:
+        function: admin-resolver
+      title: VAtlassian
+      layout: blank
+      sections:
+        - header: Setup
+          pages:
+            - title: Administrators
+              route: admins
+            - title: Approver roles
+              route: roles
+            - title: Controlled transitions
+              route: transitions
+            - title: Controlled fields
+              route: fields
+            - title: Test management
+              route: test-management
+        - header: Evidence
+          pages:
+            - title: Audit ledger
+              route: ledger
+            - title: Export & retention
+              route: retention
+            - title: Content changes
+              route: content-review
+        - header: Operations
+          pages:
+            - title: Settings
+              route: settings
+            - title: Credentials & recovery
+              route: credentials
+            - title: Control health
+              route: health
+    - key: va-admin-configure
+      resource: main-ui
+      resolver:
+        function: admin-resolver
+      title: VAtlassian configuration
+      useAsConfig: true
+  trigger:
+    - key: va-on-issue-updated
+      function: on-issue-updated
+      events: [ avi:jira:updated:issue ]
+    - key: va-on-issue-transitioned
+      function: on-issue-transitioned
+      events: [ avi:jira:transitioned:issue ]
+    - key: va-on-issue-created
+      function: on-issue-created
+      events: [ avi:jira:created:issue ]
+
+    - key: va-on-issue-deleted
+      function: on-issue-deleted
+      events: [ avi:jira:deleted:issue ]
+    - key: va-on-issue-link
+      function: on-issue-link
+      events: [ avi:jira:created:issuelink, avi:jira:deleted:issuelink ]
+    # Detective control behind the signed sprint start and complete: a sprint
+    # started or closed with Jira's own button is recorded and alerted
+    # (src/triggers/sprint-event.js). Jira gives apps no veto on either.
+    - key: va-on-sprint-event
+      function: on-sprint-event
+      events: [ avi:jira-software:started:sprint, avi:jira-software:closed:sprint ]
+
+  # Temporary live probe for the attachment design (src/jobs/probe.js).
+  # Read-only, guarded by the encrypted PROBE_SECRET variable. Remove when done.
+  webtrigger:
+    - key: va-probe
+      function: probe
+    - key: va-ci-intake
+      function: ci-intake
+      urlFormat: v2
+      response:
+        type: static
+        outputs:
+          - key: accepted
+            statusCode: 202
+            contentType: application/json
+            body: '{"accepted":true}'
+          - key: rejected
+            statusCode: 400
+            contentType: application/json
+            body: '{"accepted":false}'
+          - key: unauthorized
+            statusCode: 401
+            contentType: application/json
+            body: '{"accepted":false}'
+          - key: too-large
+            statusCode: 413
+            contentType: application/json
+            body: '{"accepted":false}'
+          - key: unavailable
+            statusCode: 503
+            contentType: application/json
+            body: '{"accepted":false}'
+  scheduledTrigger:
+    - key: trigger-five-minute
+      function: runner-five-minute
+      interval: fiveMinute
+    - key: trigger-hourly
+      function: runner-hourly
+      interval: hour
+    - key: trigger-daily
+      function: runner-daily
+      interval: day
+
+  function:
+    - key: ci-intake
+      handler: jobs/ciIntake.runCiIntake
+    - key: ci-intake-worker
+      handler: jobs/ciIntake.runCiIntakeWorker
+      timeoutSeconds: 600
+    - key: probe
+      handler: jobs/probe.handler
+    - key: restore-worker
+      handler: jobs/restoreWorker.handler
+      timeoutSeconds: 600
+      # Whole attachment files are held in memory while they are hashed and
+      # copied (lib/vaultObjectStore.js MAX_VAULT_BYTES is set against this).
+      runtime:
+        memoryMB: 1024
+    - key: vault-worker
+      handler: jobs/vaultWorker.handler
+      timeoutSeconds: 600
+      # Whole attachment files are held in memory while they are hashed and
+      # copied (lib/vaultObjectStore.js MAX_VAULT_BYTES is set against this).
+      runtime:
+        memoryMB: 1024
+    - key: link-worker
+      handler: jobs/linkWorker.handler
+      timeoutSeconds: 600
+    - key: sprint-worker
+      handler: jobs/sprintWorker.handler
+      timeoutSeconds: 600
+
+    - key: issue-status
+      handler: resolvers/issueStatus.handler
+    - key: panel-resolver
+      handler: resolvers/panel.handler
+    - key: admin-resolver
+      handler: resolvers/admin.handler
+    - key: test-resolver
+      handler: resolvers/testManagement.handler
+    - key: totp-resolver
+      handler: resolvers/totp.handler
+    - key: sprint-resolver
+      handler: resolvers/sprint.handler
+    - key: gate
+      handler: gate.validate
+    - key: on-issue-updated
+      handler: triggers/issue-updated.run
+    - key: on-issue-transitioned
+      handler: triggers/issue-transitioned.run
+    - key: on-issue-created
+      handler: triggers/issue-created.run
+
+    - key: on-issue-deleted
+      handler: triggers/issue-deleted.run
+    - key: on-issue-link
+      handler: triggers/issue-link.run
+    - key: on-sprint-event
+      handler: triggers/sprint-event.run
+
+    - key: runner-five-minute
+      handler: jobs/runner.runFiveMinute
+    - key: runner-hourly
+      handler: jobs/runner.runHourly
+    - key: runner-daily
+      handler: jobs/runner.runDaily
+resources:
+  - key: main-ui
+    path: frontend/dist
+  - key: ui-kit-approval-view
+    path: src/ui-kit/view.jsx
+permissions:
+  # This declaration forfeits Runs on Atlassian eligibility. Biometric approval
+  # needs navigator.credentials.get(), but Jira does not delegate
+  # publickey-credentials-get to Custom UI iframes. The check runs in a popup.
+  # The documented popup recipe requires external.fetch.client: "*" to add
+  # allow-popups and allow-popups-to-escape-sandbox to the iframe sandbox.
+  #
+  # The app makes no external fetch calls here. This connect-src declaration
+  # supplies the popup sandbox permissions. Eligibility checks the declaration,
+  # not its use. Remove it if BIOMETRIC is withdrawn or Atlassian delegates
+  # publickey-credentials-get to app frames.
+  external:
+    fetch:
+      client:
+        - address: "*"
+  scopes:
+    - storage:app
+    - read:jira-work
+    - write:jira-work
+    - read:jira-user
+    - manage:jira-configuration
+    # Sprint readiness lists a sprint's work items (Jira Software REST), and
+    # "Sign and start sprint" starts it once every tree is ready (lib/sprintStart.js).
+    # "Sign and complete sprint" moves the open items to a future sprint or the
+    # backlog, then closes it; the board's future sprints are read for the choice.
+    - read:sprint:jira-software
+    - read:issue-details:jira
+    - read:jql:jira
+    - write:sprint:jira-software
+    - read:board-scope:jira-software
+    - write:board-scope:jira-software
+
+  content:
+    styles: [ unsafe-inline ]

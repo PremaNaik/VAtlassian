@@ -1,0 +1,249 @@
+import { DENY, FailClosed, ancestorDriftMessage, descendantDriftMessage } from './lib/errors.js';
+import { meetsAssurance, isAssuranceLevel, effectiveAssurance } from './lib/approval/levels.js';
+import { validEvidence } from './lib/approval/record.js';
+import { normalizeCode } from './lib/totp.js';
+import { EVENT } from './lib/ledger.js';
+import { withRequestCache } from './lib/cache.js';
+import { harnessLog } from './lib/harnessLogger.js';
+import { guardMessage } from './testmgmt/executionGuard.js';
+
+export function submittedApprovalToken(fields) {
+  if (!fields || typeof fields !== 'object') return null;
+  return Object.values(fields).find(value => typeof value === 'string' && /^[a-f0-9]{32}$/.test(value)) ?? null;
+}
+/** The transition id the validator's setup screen saved into its configuration
+ *  (GateConfig.tsx), or null. Jira passes the configuration as an object; a
+ *  string is parsed defensively, and anything unreadable is simply absent. */
+export function configuredTransitionId(configuration) {
+  let config = configuration;
+  if (typeof config === 'string') { try { config = JSON.parse(config); } catch { return null; } }
+  const id = config && typeof config === 'object' ? config.transitionId : null;
+  return id == null || String(id) === '' ? null : String(id);
+}
+export function rawCodeSubmitted(fields) {
+  return fields && typeof fields === 'object'
+    ? Object.values(fields).some(value => typeof value === 'string' && /^\d{6}$/.test(normalizeCode(value))) : false;
+}
+
+/** The approval content hash is costly for a tree baseline (it reads the whole
+ *  tree), so the runtime hands it over as a thunk and only a signature check
+ *  pays for it. A plain value is accepted too. */
+async function contentHashOf(snapshot, approval) {
+  return typeof snapshot.contentHash === 'function' ? snapshot.contentHash(approval) : snapshot.contentHash;
+}
+
+/**
+ * Stateless lambda validator. Identity was established by the resolver, never this payload.
+ *
+ * Attached to EVERY transition of a governed workflow. It holds a drifted work
+ * item on all of them, and asks for a signature only on the transitions
+ * VAtlassian administration controls.
+ */
+export function createGate(deps) {
+  return async function validate(payload) {
+    const startedAt = deps.now();
+    const issueKey = payload?.issue?.key;
+    const fromStatusId = payload?.transition?.from?.id == null ? null : String(payload.transition.from.id);
+    const toStatusId = payload?.transition?.to?.id == null ? null : String(payload.transition.to.id);
+    // The exact Jira transition, not just the status pair it moves between.
+    // Two sibling transitions can share a destination status, and this is what
+    // stops a receipt signed for one from completing the other.
+    let transitionId = payload?.transition?.id == null ? null : String(payload.transition.id);
+    const token = submittedApprovalToken(payload?.transition?.modifiedFields);
+    const rawCode = rawCodeSubmitted(payload?.transition?.modifiedFields);
+    const facts = { issueKey, fromStatusId, toStatusId, transitionId, hasToken: token != null, hasRawCode: rawCode };
+    deps.log({ event: 'gate:enter', ...facts });
+    harnessLog('GATE', 'gate:enter', facts);
+    const deny = async (reason, detail, extra = {}) => {
+      const elapsedMs = deps.now() - startedAt;
+      // WHAT THE LIVE CHECK FLAGGED, when drift is why. Field ids and the cause
+      // only: the full per-field digests are in the DRIFT log line, and the
+      // ledger should not carry them.
+      const drift = extra.drift ?? null;
+      // Both hashes and what the recompute covered, when a hash mismatch is why.
+      // Log lines only: the ledger does not carry them.
+      const hashes = extra.hashes ?? null;
+      deps.log({ event: 'gate:deny', ...facts, reason, detail, elapsedMs, ...(drift ? { drift } : {}), ...(hashes ? { hashes } : {}) });
+      harnessLog('GATE', 'gate:deny', { ...facts, reason, detail, elapsedMs, ...(drift ? { drift } : {}), ...(hashes ? { hashes } : {}) }, 'WARN');
+      try { await deps.audit({ eventType: 'TRANSITION_BLOCKED', actorAccountId: 'system', payload: { ...facts, reason, detail: detail ?? null, elapsedMs, ...(drift ? { drift } : {}) } }, { deadlineMs: 1200 }); } catch { /* refusal remains closed even if evidence storage is down */ }
+      const assurance = extra.required ? ` Obtained: ${extra.obtained ?? 'none'}. Required: ${extra.required}.` : '';
+      return { result: false, errorMessage: (extra.message ?? DENY[reason] ?? DENY.SERVICE_UNAVAILABLE) + assurance };
+    };
+    const allow = (detail) => {
+      const elapsedMs = deps.now() - startedAt;
+      deps.log({ event: 'gate:allow', ...facts, detail, elapsedMs });
+      harnessLog('GATE', 'gate:allow', { ...facts, detail, elapsedMs });
+      return { result: true };
+    };
+
+    // Creating a work item: Jira sends no issue and no origin status. There is no
+    // item yet, so there is nothing to hold, no baseline and no drift. Refusing
+    // here blocked every Create. Any other payload with a missing part is still
+    // refused as malformed.
+    if (!issueKey && !fromStatusId && toStatusId) return allow('ISSUE_CREATION');
+    if (!issueKey || !fromStatusId || !toStatusId) return deny('SERVICE_UNAVAILABLE', 'MALFORMED_PAYLOAD');
+    try {
+      const snapshot = await deps.load({ issueKey, fromStatusId, toStatusId, transitionId,
+        approvalId: token, modifiedFields: payload?.transition?.modifiedFields,
+        configuredTransitionId: configuredTransitionId(payload?.configuration) });
+      const { ct, item, issueId, projectId, issueTypeId, driftCount } = snapshot;
+
+      // ── The item: held on every transition this validator is attached to ──
+      //
+      // One validator, attached to every transition, is the whole Jira-side
+      // setup. What it holds first is the WORK ITEM, not the edge: a baselined
+      // item whose content has moved stays where it is until that change is
+      // approved or reverted. There is no per-edge switch. A count that cannot
+      // be read fails closed like any other.
+      //
+      // Except in a project disabled in VAtlassian: the panel refuses every
+      // drift decision there, so holding drift would freeze the item with no
+      // way to release it. Off means off.
+      //
+      // A restore that is actually running holds the item too. ERROR is not
+      // one: it means a restore failed and needs attention, and nothing clears
+      // it while the content matches the baseline, so holding it here would
+      // freeze the item on every transition with nothing to decide. Drift, if
+      // any, still holds it below; the signature half still refuses ERROR.
+      const projectDisabled = snapshot.health?.enabled === false;
+      if (['RESTORING', 'DECIDING'].includes(item?.state) || item?.lock_token) return deny('RESTORE_IN_PROGRESS', 'ITEM_BUSY');
+      if (item?.state === 'LOCKED') return deny('RECORD_LOCKED', 'ITEM_LOCKED');
+      if (!projectDisabled && !Number.isSafeInteger(driftCount)) return deny('UNDECIDED_DRIFT', 'DRIFT_UNREADABLE');
+      // A link approved on the other end and not yet recorded here is still
+      // drift until it is (jobs/linkWorker.js); the refusal says it is coming.
+      if (!projectDisabled && driftCount > 0) {
+        return deny(snapshot.linkPending ? 'LINK_DECISION_PENDING' : 'UNDECIDED_DRIFT', 'DRIFT_OUTSTANDING', {
+          drift: { count: driftCount, changed: (snapshot.driftedFields ?? []).slice(0, 40),
+            cause: snapshot.driftDiagnostics?.cause ?? null, digestSource: snapshot.driftDiagnostics?.digestSource ?? null,
+            baselineVersion: snapshot.driftDiagnostics?.baselineVersion ?? null,
+            baselineIssueTypeId: snapshot.driftDiagnostics?.baselineIssueTypeId ?? null, issueTypeId: issueTypeId ?? null,
+            scopeSource: snapshot.driftScope?.source ?? null, scopeIssueTypeId: snapshot.driftScope?.issueTypeId ?? null }
+        });
+      }
+
+      // HELD FROM ABOVE. Drift is flagged upward and held downward: a work item
+      // whose own content is unchanged still cannot move while an issue above
+      // it (Jira's parent field) has undecided drift of its own
+      // (lib/ancestorHold.js). An ancestor that could not be read fails closed.
+      if (!projectDisabled && snapshot.ancestorDriftError) return deny('ANCESTOR_DRIFT', 'ANCESTOR_UNREADABLE');
+      if (!projectDisabled && snapshot.ancestorDrift) {
+        const above = snapshot.ancestorDrift;
+        return deny('ANCESTOR_DRIFT', 'ANCESTOR_DRIFT_OUTSTANDING', {
+          message: ancestorDriftMessage(above),
+          drift: { heldBy: above.issueKey, heldByIssueId: above.issueId, depth: above.depth, changed: above.changed }
+        });
+      }
+
+      // HELD FROM BELOW. The reverse hold (lib/ancestorHold.js driftedDescendant):
+      // an item cannot move while a child anywhere under it has undecided drift.
+      // A child tree that could not be read, or is over the limit, fails closed.
+      if (!projectDisabled && snapshot.descendantDriftError) return deny('DESCENDANT_DRIFT', 'DESCENDANT_UNREADABLE');
+      if (!projectDisabled && snapshot.descendantDrift) {
+        const below = snapshot.descendantDrift;
+        return deny('DESCENDANT_DRIFT', 'DESCENDANT_DRIFT_OUTSTANDING', {
+          message: descendantDriftMessage(below),
+          drift: { heldBy: below.issueKey, heldByIssueId: below.issueId, depth: below.depth, changed: below.changed }
+        });
+      }
+
+      // TEST EXECUTIONS. Done only when every run is terminal and every failed
+      // run has its bug (testmgmt/executionGuard.js). A guard that could not be
+      // read fails closed. This is test management's own control, so a project
+      // switched off for baselines does not switch it off.
+      if (snapshot.testGuard?.error) return deny('TEST_RUNS_OPEN', 'TEST_GUARD_UNREADABLE');
+      if (snapshot.testGuard?.open?.length) {
+        return deny('TEST_RUNS_OPEN', 'TEST_RUNS_OPEN', { message: guardMessage(snapshot.testGuard.open) });
+      }
+      if (snapshot.closureGuard && (snapshot.closureGuard.error || snapshot.closureGuard.verdict !== 'ALLOWED' || snapshot.closureGuard.auditConfirmed !== true)) {
+        return deny('SERVICE_UNAVAILABLE', 'GOVERNED_CLOSURE_DENIED', {
+          message: 'Governed closure is blocked. Open the requirement’s Test management panel for its recorded closure evaluation.'
+        });
+      }
+
+      // ── The edge: a signature only where VAtlassian controls it ──────────
+      //
+      // Jira's workflow-validator Lambda payload does not include transition.id.
+      // Runtime loading may recover it from Jira's live transition list, but the
+      // edge remains exact before the approval capability is queried or spent.
+      if (snapshot.edgeFailure) return deny(snapshot.edgeFailure, 'EDGE_UNRESOLVED');
+      transitionId = transitionId ?? (snapshot.transitionId == null ? null : String(snapshot.transitionId));
+      facts.transitionId = transitionId;
+      // Sibling transitions none of which is controlled: the drift hold above
+      // was all there was to enforce.
+      if (!transitionId && !ct) return allow('UNCONTROLLED_EDGE');
+      if (!transitionId) return deny('SERVICE_UNAVAILABLE', 'MALFORMED_PAYLOAD');
+      if (ct && projectDisabled) return deny('NOT_CONFIGURED', 'PROJECT_DISABLED');
+      const approval = await deps.pending({ issueId, fromStatusId, toStatusId, transitionId, now: deps.now(), approvalId: token });
+      // An edge with no controlled transition behind it asks for no signature.
+      // The one exception is an approval bound to a baseline, which carries its
+      // own policy for this edge and is checked in full below.
+      if (!ct && approval?.baseline_id == null) return allow('UNCONTROLLED_EDGE');
+      // A six-digit value is only an authenticator code where a signature is
+      // being asked for. On any other screen it is just data (a postcode, a
+      // count), so the trap sits here, after the drift hold, not before it.
+      if (rawCode) return deny('RAW_CODE_ON_SCREEN', 'RAW_TOTP_CODE_IN_MODIFIED_FIELDS');
+      // A failed restore still refuses a signed move, as it always has.
+      if (item?.state === 'ERROR') return deny('RESTORE_IN_PROGRESS', 'ITEM_BUSY');
+      if (!approval || approval.state !== 'PENDING' || approval.decision !== 'APPROVE') return deny('NO_DECISION', 'NO_CANDIDATE_ROW');
+      if (token && approval.approval_id.toString('hex') !== token) return deny('NO_DECISION', 'TRANSITION_SCREEN_TOKEN_MISMATCH');
+      if (Number(approval.expires_at) <= deps.now()) return deny('DECISION_EXPIRED', 'EXPIRED');
+      if (String(approval.issue_id) !== String(issueId) || String(approval.project_id) !== String(projectId)
+          || String(approval.issue_type_id) !== String(issueTypeId) || approval.from_status_id !== fromStatusId
+          || approval.to_status_id !== toStatusId || String(approval.transition_id) !== transitionId) return deny('NO_DECISION', 'EDGE_BINDING_MISMATCH');
+      const policy = approval.baseline_id != null
+        ? await deps.policyForApproval?.({ approval, issueId, projectId, issueTypeId })
+        : ct;
+      if (!policy || !isAssuranceLevel(policy.required_assurance) || !policy.required_role || !policy.meaning) return deny('NOT_CONFIGURED', 'INVALID_EDGE_POLICY');
+      const required = effectiveAssurance(policy.required_assurance);
+      if (!meetsAssurance(approval.assurance_level, required)) return deny('INSUFFICIENT_ASSURANCE', 'ASSURANCE_FLOOR', { obtained: approval.assurance_level, required });
+      const evidenceValid = validEvidence(approval);
+      const recomputedHash = evidenceValid ? await contentHashOf(snapshot, approval) : null;
+      if (!evidenceValid || approval.content_hash !== recomputedHash) {
+        return deny('CONTENT_CHANGED', 'CONTENT_OR_EVIDENCE_CHANGED', { hashes: { evidenceValid,
+          approvalHash: approval.content_hash ?? null, recomputedHash, basis: snapshot.hashBasis?.() ?? null } });
+      }
+      if (approval.signer_role !== policy.required_role || approval.meaning !== policy.meaning) return deny('POLICY_CHANGED', 'POLICY_CHANGED');
+      if (!await deps.eligible({ accountId: approval.account_id, issueTypeId, projectId, role: policy.required_role })) return deny('ELIGIBILITY_REVOKED', 'ELIGIBILITY_REVOKED');
+      const result = await deps.consume({ approvalId: approval.approval_id, now: deps.now() });
+      if (!result?.consumed) return deny('NO_DECISION', 'CAS_LOST_RACE');
+      // Consumed before the success audit; an audit failure spends the approval but never allows Jira.
+      await deps.audit({
+        eventType: EVENT.SIGNATURE_CONSUMED,
+        actorAccountId: approval.account_id,
+        issueId,
+        approvalId: approval.approval_id,
+        payload: {
+          actorName: approval.printed_name ?? approval.actor_name,
+          role: approval.signer_role,
+          assuranceLevel: approval.assurance_level,
+          meaning: approval.meaning,
+          fromStatusId,
+          toStatusId,
+          transitionId: approval.transition_id ?? (payload?.transition?.id ? String(payload.transition.id) : null),
+          decision: approval.decision
+        }
+      });
+      await deps.voidOthers({ issueId, exceptApprovalId: approval.approval_id, now: deps.now() });
+      return allow('SIGNATURE_CONSUMED');
+
+    } catch (error) {
+      return deny(error instanceof FailClosed ? error.reason : 'SERVICE_UNAVAILABLE', 'FAIL_CLOSED');
+    }
+  };
+}
+
+export async function validate(payload) {
+  return withRequestCache(() => validateUncached(payload));
+}
+
+async function validateUncached(payload) {
+  // Entry is logged before lazy imports, so cold-start/import failures are visible too.
+  console.log('gate:invoked', JSON.stringify({ issueKey: payload?.issue?.key ?? null }));
+  try {
+    const { gateRuntime } = await import('./lib/approval/runtime.js');
+    return await createGate(await gateRuntime())(payload);
+  } catch {
+    console.log('gate:deny', JSON.stringify({ reason: 'SERVICE_UNAVAILABLE', detail: 'INITIALIZATION_FAILED' }));
+    return { result: false, errorMessage: DENY.SERVICE_UNAVAILABLE };
+  }
+}

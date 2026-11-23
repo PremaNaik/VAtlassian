@@ -1,0 +1,382 @@
+/**
+ * Shared presentation components for the admin console and signing panel.
+ * They contain no product logic, resolver calls or resolver types.
+ * Class names refer to the shared styles in tokens.css.
+ */
+
+import type { ReactNode } from 'react';
+import Spinner from '@atlaskit/spinner';
+import { avatarColour, initials, nameOr } from './format';
+
+/* ------------------------------------------------------------------ layout */
+
+export function Page({
+  eyebrow,
+  title,
+  lead,
+  actions,
+  variant = 'page',
+  children
+}: {
+  eyebrow?: string;
+  title?: ReactNode;
+  lead?: ReactNode;
+  actions?: ReactNode;
+  variant?: 'page' | 'panel';
+  children: ReactNode;
+}) {
+  return (
+    <div className={variant === 'panel' ? 'va-page va-page--panel' : 'va-page'}>
+      {(title || lead || eyebrow) && (
+        <header className="va-page__header">
+          <div className="va-row">
+            <div style={{ minWidth: 0 }}>
+              {eyebrow && <p className="va-page__eyebrow">{eyebrow}</p>}
+              {title && <h1 className="va-page__title">{title}</h1>}
+            </div>
+            {actions && (
+              <>
+                <span className="va-spacer" />
+                {actions}
+              </>
+            )}
+          </div>
+          {lead && <p className="va-page__lead">{lead}</p>}
+        </header>
+      )}
+      {children}
+    </div>
+  );
+}
+
+export function Section({ title, children }: { title: string; children: ReactNode }) {
+  return (
+    <section className="va-section">
+      <h2 className="va-section__title">{title}</h2>
+      {children}
+    </section>
+  );
+}
+
+export function Card({
+  title,
+  subtitle,
+  tone = 'default',
+  flush = false,
+  children
+}: {
+  title?: string;
+  subtitle?: ReactNode;
+  tone?: 'default' | 'sunken';
+  flush?: boolean;
+  children: ReactNode;
+}) {
+  const classes = ['va-card'];
+  if (tone === 'sunken') classes.push('va-card--sunken');
+  if (flush) classes.push('va-card--flush');
+  return (
+    <div className={classes.join(' ')}>
+      {(title || subtitle) && (
+        <div className="va-card__header">
+          {title && <h3 className="va-card__title">{title}</h3>}
+          {subtitle && <p className="va-card__subtitle">{subtitle}</p>}
+        </div>
+      )}
+      {children}
+    </div>
+  );
+}
+
+export function Stack({ gap = 'normal', children }: { gap?: 'normal' | 'tight'; children: ReactNode }) {
+  return <div className={gap === 'tight' ? 'va-stack va-stack--tight' : 'va-stack'}>{children}</div>;
+}
+
+/* ------------------------------------------------------------------ status */
+
+export function Loading({ label = 'Loading…' }: { label?: string }) {
+  return (
+    <div className="va-loading">
+      <Spinner size="medium" />
+      <span>{label}</span>
+    </div>
+  );
+}
+
+export function EmptyState({ title, children }: { title: string; children?: ReactNode }) {
+  return (
+    <div className="va-empty">
+      <p className="va-empty__title">{title}</p>
+      {children && <p className="va-empty__body">{children}</p>}
+    </div>
+  );
+}
+
+export type Tone = 'neutral' | 'brand' | 'success' | 'warning' | 'danger';
+
+export function Badge({ tone = 'neutral', children }: { tone?: Tone; children: ReactNode }) {
+  return <span className={`va-badge va-badge--${tone}`}>{children}</span>;
+}
+
+/* ------------------------------------------------------------------- value */
+
+/**
+ * A name that may not have resolved, rendered so the two cases are visually
+ * distinct. See format.ts for why the id is never the fallback.
+ */
+export function Name({ value, noun }: { value: string | null | undefined; noun: string }) {
+  const resolved = nameOr(value, noun);
+  return resolved.unknown ? (
+    <span className="va-unknown">{resolved.text}</span>
+  ) : (
+    <>{resolved.text}</>
+  );
+}
+
+/**
+ * Open a work item or project in Jira using router.open. A normal left-click
+ * would navigate this Custom UI iframe instead of the containing Jira tab.
+ * Keep a real href for the browser's open-in-new-tab and copy-link actions.
+ */
+function ForgeLink({ href, children }: { href: string; children: ReactNode }) {
+  return (
+    <a
+      className="va-link"
+      href={href}
+      onClick={(event) => {
+        if (event.metaKey || event.ctrlKey || event.shiftKey || event.button !== 0) return;
+        event.preventDefault();
+        import('@forge/bridge')
+          .then(({ router }) => router.open(href))
+          .catch(() => {
+            window.open(href, '_blank', 'noopener,noreferrer');
+          });
+      }}
+    >
+      {children}
+    </a>
+  );
+}
+
+export function IssueLink({ issueKey, summary }: { issueKey: string; summary?: string | null }) {
+  return (
+    <>
+      <ForgeLink href={`/browse/${issueKey}`}>{issueKey}</ForgeLink>
+      {summary && <div className="va-secondary">{summary}</div>}
+    </>
+  );
+}
+
+/** `projectKey` is optional because some rows resolve a project's name but
+ *  never its key. See admin.js. Render these as plain text without a link. */
+export function ProjectLink({ projectKey, name }: { projectKey?: string | null; name: string | null | undefined }) {
+  const resolved = nameOr(name, 'project');
+  if (resolved.unknown) return <span className="va-unknown">{resolved.text}</span>;
+  if (!projectKey) return <>{resolved.text}</>;
+  return <ForgeLink href={`/browse/${projectKey}`}>{resolved.text}</ForgeLink>;
+}
+
+/** A person: avatar, name, and one line of context (their role, their email). */
+export function Person({
+  name,
+  meta,
+  noun = 'user'
+}: {
+  name: string | null | undefined;
+  meta?: ReactNode;
+  noun?: string;
+}) {
+  const resolved = nameOr(name, noun);
+  return (
+    <div className="va-person">
+      <span
+        className="va-person__avatar"
+        style={{ background: resolved.unknown ? 'var(--va-border-strong)' : avatarColour(resolved.text) }}
+        aria-hidden="true"
+      >
+        {resolved.unknown ? '?' : initials(resolved.text)}
+      </span>
+      <div className="va-person__body">
+        <div className={resolved.unknown ? 'va-person__name va-unknown' : 'va-person__name'}>
+          {resolved.text}
+        </div>
+        {meta && <div className="va-person__meta">{meta}</div>}
+      </div>
+    </div>
+  );
+}
+
+/** Label/value pairs. Values are ReactNode so they can carry a <Name>. */
+export function Facts({ items }: { items: Array<{ label: string; value: ReactNode }> }) {
+  return (
+    <dl className="va-facts">
+      {items.map((item) => (
+        <div key={item.label} style={{ display: 'contents' }}>
+          <dt>{item.label}</dt>
+          <dd>{item.value}</dd>
+        </div>
+      ))}
+    </dl>
+  );
+}
+
+/** "Backlog → In Review", the shape a workflow edge should always take. */
+export function StatusFlow({ from, to }: { from: ReactNode; to: ReactNode }) {
+  return (
+    <span className="va-row" style={{ gap: '6px' }}>
+      {from}
+      <span className="va-arrow" aria-label="changes to">
+        →
+      </span>
+      {to}
+    </span>
+  );
+}
+
+/* ------------------------------------------------------------------- table */
+
+export function Table({
+  columns,
+  children
+}: {
+  columns: Array<{ key: string; label: string; align?: 'left' | 'right' }>;
+  children: ReactNode;
+}) {
+  return (
+    <table className="va-table">
+      <thead>
+        <tr>
+          {columns.map((column) => (
+            <th key={column.key} className={column.align === 'right' ? 'va-table__actions' : undefined}>
+              {/* A header whose only content is an actions column should not
+                  announce a meaningless label to a screen reader. */}
+              {column.label || <span className="va-visually-hidden" />}
+            </th>
+          ))}
+        </tr>
+      </thead>
+      <tbody>{children}</tbody>
+    </table>
+  );
+}
+
+/* -------------------------------------------------------------------- form */
+
+export function Field({
+  label,
+  hint,
+  children
+}: {
+  label: string;
+  hint?: ReactNode;
+  children: ReactNode;
+}) {
+  return (
+    <label className="va-field">
+      <span className="va-label">{label}</span>
+      {children}
+      {hint && <span className="va-hint">{hint}</span>}
+    </label>
+  );
+}
+
+export function Select({
+  value,
+  onChange,
+  disabled,
+  ariaLabel,
+  placeholder,
+  options
+}: {
+  value: string;
+  onChange: (value: string) => void;
+  disabled?: boolean;
+  ariaLabel?: string;
+  placeholder: string;
+  options: Array<{ value: string; label: string }>;
+}) {
+  return (
+    <select
+      className="va-select"
+      aria-label={ariaLabel}
+      value={value}
+      disabled={disabled}
+      onChange={(event) => onChange(event.target.value)}
+    >
+      <option value="">{placeholder}</option>
+      {options.map((option) => (
+        <option key={option.value} value={option.value}>
+          {option.label}
+        </option>
+      ))}
+    </select>
+  );
+}
+
+/**
+ * The 6-digit authenticator code input. Strip non-digits so copied codes
+ * such as "123 456" work. Failed verification counts toward the lockout in
+ * src/lib/totp.js.
+ */
+export function CodeInput({
+  value,
+  onChange,
+  onSubmit,
+  disabled,
+  id
+}: {
+  value: string;
+  onChange: (value: string) => void;
+  onSubmit?: () => void;
+  disabled?: boolean;
+  id?: string;
+}) {
+  return (
+    <input
+      id={id}
+      className="va-code"
+      value={value}
+      disabled={disabled}
+      inputMode="numeric"
+      autoComplete="one-time-code"
+      placeholder="000000"
+      aria-label="Six-digit authenticator code"
+      maxLength={6}
+      onChange={(event) => onChange(event.target.value.replace(/\D/g, '').slice(0, 6))}
+      onKeyDown={(event) => {
+        if (event.key === 'Enter' && onSubmit) {
+          event.preventDefault();
+          onSubmit();
+        }
+      }}
+    />
+  );
+}
+
+/**
+ * Require the signer's affirmation before enabling the code input.
+ * The code verifies identity. The checkbox records the intended meaning
+ * of the signature for 21 CFR 11.50(a)(4).
+ */
+export function Affirmation({
+  checked,
+  onChange,
+  disabled,
+  children
+}: {
+  checked: boolean;
+  onChange: (checked: boolean) => void;
+  disabled?: boolean;
+  children: ReactNode;
+}) {
+  return (
+    <label className={checked ? 'va-affirm va-affirm--checked' : 'va-affirm'}>
+      <input
+        type="checkbox"
+        checked={checked}
+        disabled={disabled}
+        onChange={(event) => onChange(event.target.checked)}
+      />
+      <span className="va-affirm__text">{children}</span>
+    </label>
+  );
+}

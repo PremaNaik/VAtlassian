@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <title>VAtlassian Device Check</title>
+    <!--
+      No inline scripts here: Forge's CSP (script-src 'self') blocks them.
+      popup-boot.js installs the __bridge shim and startup error handler; as a
+      classic script it runs before the module bundle below.
+    -->
+    <script src="./popup-boot.js"></script>
+  </head>
+
+  <body>
+    <div id="root">
+      <div data-popup-placeholder style="padding:24px;font-family:Arial,sans-serif;">
+        Loading device check…
+      </div>
+    </div>
+
+    <script type="module" src="./src/popup/main.tsx"></script>
+  </body>
+</html>

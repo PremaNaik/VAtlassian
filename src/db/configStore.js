@@ -1,0 +1,668 @@
+import { executeQuery, toBinaryParam, fromBinaryColumn, limitClause, affectedRows } from '../lib/db.js';
+import { newId, throwing } from './store.js';
+import { withAlwaysControlled } from '../lib/content.js';
+import { effectiveAssurance } from '../lib/approval/levels.js';
+import { memo } from '../lib/cache.js';
+import { FailClosed } from '../lib/errors.js';
+import { validateConfig, stripRetiredConfig } from '../lib/configValidation.js';
+
+/**
+ * va_config, va_controlled_transition, va_controlled_field, va_eligibility.
+ *
+ * Everything an administrator sets, and the queries the gate and the panel ask
+ * of it. Read paths here are on the ~10s validator budget, so each one is a
+ * single indexed statement and none of them fans out.
+ */
+
+const ACTIVE = 'ACTIVE';
+
+// ── va_config ────────────────────────────────────────────────────────────────
+
+/** Defaults apply only to absent rows. Never replace saved, unreadable controls
+ * with defaults, or include the raw row/parser error in an exposed refusal. */
+function decodeConfig(value) {
+  try { return JSON.parse(value); }
+  catch { throw new FailClosed('CONFIGURATION_INVALID'); }
+}
+
+function governedConfig(config) {
+  try { return validateConfig(stripRetiredConfig(config)); }
+  catch { throw new FailClosed('CONFIGURATION_INVALID'); }
+}
+
+export async function getConfig(key, fallback = null) {
+  return memo(`config:${key}`, async () => {
+    const rows = await throwing('SELECT cfg_value FROM va_config WHERE cfg_key = ?', [key]);
+    if (rows.length === 0) return fallback;
+    const config = decodeConfig(rows[0].cfg_value);
+    // Other keys intentionally store generic JSON values, including scalars.
+    return key === 'site' || key.startsWith('project:') ? governedConfig(config) : config;
+  });
+}
+
+export async function setConfig(key, value, updatedBy, now) {
+  await throwing(
+    `REPLACE INTO va_config (cfg_key, cfg_value, updated_at, updated_by) VALUES (?, ?, ?, ?)`,
+    [key, JSON.stringify(value), now, updatedBy]
+  );
+}
+
+/** Administrative reads must expose corrupt data and preserve the exact saved
+ * value as an optimistic concurrency token, including an absent row. */
+export async function readConfigRecord(key) {
+  const rows = await throwing('SELECT cfg_value FROM va_config WHERE cfg_key = ?', [key]);
+  if (!rows.length) return { config: {}, revision: null };
+  const revision = rows[0].cfg_value;
+  const config = decodeConfig(revision);
+  governedConfig(config);
+  return { config, revision };
+}
+
+export async function setConfigIfCurrent(key, value, updatedBy, now, revision) {
+  const json = JSON.stringify(value);
+  const result = revision === null
+    ? await executeQuery(`INSERT IGNORE INTO va_config (cfg_key, cfg_value, updated_at, updated_by) VALUES (?, ?, ?, ?)`, [key, json, now, updatedBy])
+    : await executeQuery(`UPDATE va_config SET cfg_value = ?, updated_at = ?, updated_by = ? WHERE cfg_key = ? AND BINARY cfg_value = BINARY ?`, [json, now, updatedBy, key, revision]);
+  if (!result.result) throw new Error('Configuration could not be saved.');
+  return affectedRows(result) === 1;
+}
+
+/**
+ * Merge site defaults with per-project settings. An unconfigured project
+ * behaves like one explicitly configured with the defaults.
+ *
+ * Read 'site' and 'project:<id>' in one WHERE cfg_key IN (?, ?) query and split
+ * the rows in JavaScript. Previously these took two round trips. getConfig
+ * memoizes individual keys, but this combined read also saves a query before
+ * the cache has entries.
+ */
+export async function projectConfig(projectId) {
+  return memo(`projectConfig:${projectId}`, async () => {
+    const projectKey = `project:${projectId}`;
+    const rows = await throwing(
+      'SELECT cfg_key, cfg_value FROM va_config WHERE cfg_key IN (?, ?)',
+      ['site', projectKey]
+    );
+    let site = {}, project = {};
+    for (const row of rows) {
+      const parsed = governedConfig(decodeConfig(row.cfg_value));
+      if (row.cfg_key === 'site') site = parsed;
+      else project = parsed;
+    }
+    return deepMerge(deepMerge(DEFAULT_PROJECT_CONFIG, site), project);
+  });
+}
+
+// isStrictMode() was removed: it had no callers, so it read as enforcement
+// that did not exist. STRICT is refused at save time in fieldsConfiguration.js
+// until the locking architecture (docs/AUDIT-2026-09-07.md, Plan 2) lands.
+
+export const DEFAULT_PROJECT_CONFIG = {
+  enabled: true,
+  ai: {
+    enabled: true,
+    models: {
+      light: 'claude-haiku-4-5-20251001',
+      standard: 'claude-sonnet-4-6',
+      deep: 'claude-opus-4-8'
+    },
+    maxCompletionTokens: 4096
+  },
+  restore: {
+    /** Writes are attributed to the app by default: a clean audit line, and no
+     *  per-user permission surprises mid-rejection. */
+    actAs: 'app',
+    notifyUsers: false,
+    perFieldRetries: 2
+  },
+  policy: {
+    mode: 'DETECT'
+  },
+  vault: {
+    /** Remove every person's Delete attachments grant from the project's
+     *  permission scheme (lib/vaultProvision.js lockAttachmentDeletion). OFF by
+     *  default: the scheme is often shared, the removal is not undone by
+     *  turning this off, and a removed file is put back from the vault on
+     *  rejection anyway. Project scope only; saveConfig refuses it for the site. */
+    lockAttachmentDeletion: false
+  }
+};
+
+/**
+ * Project ids whose administrator turned the attachment-delete lockdown on.
+ * One row per configured project, read whole and parsed here: the flag lives
+ * inside the JSON value, and the set of configured projects is small.
+ */
+export async function projectsWantingLockdown() {
+  const rows = await throwing(`SELECT cfg_key, cfg_value FROM va_config WHERE cfg_key LIKE 'project:%'`, []);
+  const ids = [];
+  for (const row of rows) {
+    try {
+      if (JSON.parse(row.cfg_value)?.vault?.lockAttachmentDeletion === true) ids.push(Number(row.cfg_key.slice('project:'.length)));
+    } catch {
+      console.error('config: unparseable value for', row.cfg_key);
+    }
+  }
+  return ids.filter(Number.isSafeInteger);
+}
+
+
+function deepMerge(base, over) {
+  const out = { ...base };
+  for (const [k, v] of Object.entries(over ?? {})) {
+    if (v && typeof v === 'object' && !Array.isArray(v) && base[k] && typeof base[k] === 'object' && !Array.isArray(base[k])) {
+      out[k] = deepMerge(base[k], v);
+    } else if (v !== undefined) {
+      out[k] = v;
+    }
+  }
+  return out;
+}
+
+// ── va_controlled_transition ──────────────────────────────────────────────────────
+
+/**
+ * Is this exact edge gated?
+ *
+ * `(from_status_id = ? OR from_status_id = '*')` with `ORDER BY from_status_id
+ * DESC`. The ordering matters because '*' sorts below any real status
+ * id, so an exact row always wins over the wildcard. That is what lets an admin
+ * write "gate everything out of Review" as one row and then override one
+ * specific edge without deleting it.
+ *
+ * The wildcard is what keeps that promise true over time. A review
+ * status typically has several outbound transitions and gains more over time;
+ * per-edge configuration silently stops covering the new ones, and nobody
+ * notices until an unreviewed item walks straight through a transition that was
+ * added last month.
+ *
+ * Match wildcard issue types too. The admin console
+ * saves a gate as `issue_type_id = '*'`. A project's review status means the
+ * same thing for a Story as for a Bug, and nobody wants to configure the gate
+ * once per issue type. Matching that column exactly would mean the console can
+ * only ever write rows this query cannot find, so no work item would ever be
+ * baselined, with no visible error: the trigger would report NOT_A_GATE,
+ * which is the ordinary case for most transitions and is not even logged.
+ */
+/**
+ * Shapes a matched va_controlled_transition row into the object every caller
+ * reads. Pulled out of gatedTransition() so the one place that decides what a
+ * "gate" object looks like does not drift from the one place that queries for
+ * it.
+ */
+function decodeControlledTransition(r) {
+  return {
+    ct_id: fromBinaryColumn(r.ct_id),
+    // Return the columns the row matched, which can differ from the input.
+    //
+    // The WHERE above accepts '*' in three places, so a returned row may have
+    // matched this edge exactly or by wildcard, and the caller cannot tell
+    // them apart from the arguments it passed in. That distinction is not
+    // used to decide whether an action is offered, which Jira's workflow
+    // decides. It is needed to describe the action: "Sign to
+    // close this as Done, available from any status" is a different promise
+    // from "Sign to move to Selected for Development", and a reviewer who is
+    // shown the second when the rule is really the first has been misled
+    // about the scope of what they are signing.
+    issue_type_id: r.issue_type_id,
+    from_status_id: r.from_status_id,
+    to_status_id: r.to_status_id,
+    // The exact Jira transition id this row was matched on. Never a wildcard:
+    // gatedTransition() requires an exact transitionId to run the query at
+    // all, so every row it returns matched one specific Jira transition, never
+    // a sibling that happens to share the same destination status.
+    transition_id: r.transition_id,
+    matched_any_status: String(r.from_status_id) === '*',
+    required_role: r.required_role,
+    meaning: r.meaning,
+    // Forge SQL returns BOOLEAN as 0/1. Coerced here so no caller has to
+    // remember that `if (row.require_decision)` is true for the string "0".
+    require_decision: !!Number(r.require_decision),
+    required_assurance: r.required_assurance,
+    capture_baseline: !!Number(r.capture_baseline)
+  };
+}
+
+/**
+ * Check whether this exact Jira transition is controlled.
+ *
+ * `transitionId` is not one more optional narrowing column alongside the
+ * project/type/status wildcards above because it identifies the edge.
+ * Two different workflow transitions ("Approve" and "Approve (fast-track)",
+ * say) can both go from status 3 to status 5; matching on status pair alone
+ * cannot tell them apart; and a rule saved against one of them must never be
+ * borrowed by the other just because they share a destination. So the id is
+ * matched exactly (never '*') and a caller that does not have one yet gets no
+ * policy at all, rather than a guess.
+ */
+export async function gatedTransition({ projectId, issueTypeId, fromStatusId, toStatusId, transitionId }) {
+  if (transitionId == null) return null;
+  return memo(`gatedTransition:${projectId}:${issueTypeId}:${fromStatusId}:${toStatusId}:${transitionId}`, async () => {
+    const rows = await throwing(
+      `SELECT TO_BASE64(ct_id) AS ct_id, issue_type_id, from_status_id, to_status_id, transition_id,
+              required_role, meaning, require_decision, required_assurance, capture_baseline
+       FROM va_controlled_transition
+       WHERE project_id = ?
+         AND (issue_type_id = ? OR issue_type_id = '*')
+         AND (from_status_id = ? OR from_status_id = '*')
+         AND (to_status_id = ? OR to_status_id = '*')
+         AND transition_id = ? AND state = ?
+       ORDER BY issue_type_id DESC, from_status_id DESC, to_status_id DESC
+       LIMIT 1`,
+      [projectId, issueTypeId, fromStatusId, toStatusId, String(transitionId), ACTIVE]
+    );
+    return rows[0] ? decodeControlledTransition(rows[0]) : null;
+  });
+}
+
+
+export async function gateActiveOutOf({ projectId, issueTypeId, fromStatusId }) {
+  return memo(`gateActiveOutOf:${projectId}:${issueTypeId}:${fromStatusId}`, async () => {
+    const rows = await throwing(
+      `SELECT required_role, meaning, required_assurance, capture_baseline FROM va_controlled_transition
+       WHERE project_id = ?
+         AND (issue_type_id = ? OR issue_type_id = '*')
+         AND (from_status_id = ? OR from_status_id = '*')
+         AND state = ?
+       ORDER BY issue_type_id DESC, from_status_id DESC
+       LIMIT 1`,
+      [projectId, issueTypeId, fromStatusId, ACTIVE]
+    );
+    return rows.length > 0
+      ? { gated: true, required_role: rows[0].required_role, required_assurance: rows[0].required_assurance,
+          capture_baseline: !!Number(rows[0].capture_baseline),
+          meaning: rows[0].meaning }
+      : { gated: false, required_role: null };
+  });
+}
+
+/** Back-compat name for the panel's `authRequired` flag. Same question now. */
+export async function requireAuthFor(scope) {
+  const { gated } = await gateActiveOutOf(scope);
+  return gated;
+}
+
+// A recall's destination used to be looked up here using the current project gate configuration
+// via a function once named
+// recallTargetStatus(). That let an edit to today's configuration silently
+// redirect a recall that a baseline signed weeks ago, with no way to tell
+// afterwards which rule actually sent an item back. Recall now takes its
+// target exclusively from the latest ACTIVE baseline's own recorded review
+// status (lib/baselinePolicy.js's `reviewStatusId`, sourced from
+// va_baseline.from_status_id), never from this table. See lib/restore/recall.js.
+
+/**
+ * Every controlled-transition scope the review page may need to surface.
+ *
+ * Directed rows produce a project/status/type JQL clause. Wildcard rows produce
+ * a project/type clause and are filtered afterward against Jira's offered
+ * transitions, because "*" is a rule scope, not a status somebody sits in.
+ */
+export async function gatedReviewStatuses() {
+  const rows = await throwing(
+    `SELECT DISTINCT project_id, issue_type_id, from_status_id, to_status_id, required_role FROM va_controlled_transition
+     WHERE state = ?
+     LIMIT ${limitClause(2000)}`,
+    [ACTIVE]
+  );
+  // The role comes back on the triple rather than being looked up separately,
+  // because one status can be the source of several gated edges with DIFFERENT
+  // required roles, such as "out of Review to Done needs APPROVER, out of Review back
+  // to In Progress needs REVIEWER" is an ordinary configuration. Collapsing
+  // them to one role per status would either hide items from somebody who can
+  // decide them or offer items to somebody who cannot.
+  return rows.map((r) => ({
+    projectId: Number(r.project_id),
+    issueTypeId: String(r.issue_type_id),
+    statusId: String(r.from_status_id),
+    toStatusId: String(r.to_status_id),
+    role: r.required_role ?? null
+  }));
+}
+
+export async function listGatedTransitions(projectId) {
+  const rows = await throwing(
+    `SELECT TO_BASE64(ct_id) AS ct_id, project_id, issue_type_id, from_status_id, to_status_id,
+            transition_id, required_role, meaning, require_decision, required_assurance, capture_baseline, state, created_at, created_by
+     FROM va_controlled_transition WHERE project_id = ? ORDER BY created_at DESC LIMIT ${limitClause(200)}`,
+    [projectId]
+  );
+  return rows.map((r) => ({
+    ...r,
+    ct_id: fromBinaryColumn(r.ct_id).toString('hex'),
+    require_decision: !!Number(r.require_decision),
+    required_assurance: r.required_assurance,
+    capture_baseline: !!Number(r.capture_baseline)
+  }));
+}
+
+/**
+ * Every project/issue-type scope that has a gate, across the whole install.
+ *
+ * The backfill's work list. DISTINCT rather than the full rows because the job
+ * only needs to know which scopes claim to be protected, so it can check
+ * whether they actually track anything.
+ */
+export async function gatedScopes() {
+  const rows = await throwing(
+    `SELECT DISTINCT project_id, issue_type_id
+     FROM va_controlled_transition WHERE state = ? LIMIT ${limitClause(500)}`,
+    [ACTIVE]
+  );
+  return rows.map((r) => ({
+    projectId: Number(r.project_id),
+    issueTypeId: String(r.issue_type_id)
+  }));
+}
+
+export async function deleteGatedTransition(id) {
+  await throwing(
+    'DELETE FROM va_controlled_transition WHERE ct_id = FROM_BASE64(?)',
+    [toBinaryParam(id)]
+  );
+}
+
+
+export async function upsertGatedTransition(row) {
+  const id = row.ct_id ?? newId();
+  await throwing(
+    `REPLACE INTO va_controlled_transition
+     (ct_id, project_id, issue_type_id, from_status_id, to_status_id, transition_id,
+      required_role, meaning, require_decision, required_assurance, capture_baseline, state, created_at, created_by)
+     VALUES (FROM_BASE64(?), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      toBinaryParam(id), row.project_id, row.issue_type_id, row.from_status_id, row.to_status_id,
+      // Recorded, never matched on. See migrations.js v034.
+      row.transition_id ?? null,
+      row.required_role, row.meaning ?? 'Approved', row.require_decision === false ? 0 : 1,
+      effectiveAssurance(row.required_assurance), row.capture_baseline === false ? 0 : 1, row.state ?? ACTIVE, row.created_at, row.created_by
+    ]
+  );
+  return id;
+}
+
+/**
+ * How many people hold each role in this project, for the gate screen.
+ *
+ * A gate naming a role nobody holds denies every transition with
+ * NO_ELIGIBLE_REVIEWER, and the admin who configured it has no way to see that
+ * from the gate screen. The rule appears well formed. This is what
+ * lets the screen say "0 people hold this" at the moment the choice is made,
+ * rather than leaving it to be discovered by a reviewer who cannot move a
+ * ticket.
+ *
+ * Counts site-wide grants (project_id IS NULL) too, because they
+ * authorize here under the same predicate lib/eligibility.js uses.
+ */
+export async function roleHolderCounts(projectId) {
+  const rows = await throwing(
+    `SELECT role, COUNT(DISTINCT account_id) AS holders
+     FROM va_eligibility
+     WHERE state = ? AND (project_id = ? OR project_id IS NULL)
+     GROUP BY role`,
+    [ACTIVE, projectId == null ? null : String(projectId)]
+  );
+  const out = {};
+  for (const r of rows) out[String(r.role)] = Number(r.holders ?? 0);
+  return out;
+}
+
+// ── va_controlled_field ──────────────────────────────────────────────────────
+
+/**
+ * The intake filter for one project/issue type, with summary and description
+ * always present.
+ *
+ * `issue_type_id = '*'` is a project-wide declaration and is what the console
+ * writes by default; a row naming a specific issue type overrides it for that
+ * type only.
+ *
+ * withAlwaysControlled() adds them if an admin has not, and adds them with
+ * `store_values: false`. The app must not start retaining the contents of a
+ * field because of a default. If the admin wants description diffs, they turn
+ * retention on for description explicitly, on a screen that says what that
+ * means.
+ */
+export async function controlledFields({ projectId, issueTypeId }) {
+  return memo(`controlledFields:${projectId}:${issueTypeId}`, async () => {
+    const rows = await throwing(
+      `SELECT TO_BASE64(cf_id) AS cf_id, field_id, field_name, field_kind, schema_type,
+              store_values, writable, materiality, state
+       FROM va_controlled_field
+       WHERE project_id = ?
+         AND (issue_type_id = ? OR issue_type_id = '*')
+       ORDER BY issue_type_id DESC`,
+      [projectId, issueTypeId]
+    );
+    // ORDER BY issue_type_id DESC puts an exact-issue-type row ahead of the '*'
+    // row for the same field. Resolve that precedence before filtering state:
+    // an exact EXCLUDED row must suppress an ACTIVE project-wide default.
+    const byField = new Map();
+    for (const r of rows) if (!byField.has(r.field_id)) byField.set(r.field_id, r);
+    const declared = [...byField.values()].filter(r => r.state === ACTIVE).map((r) => ({
+      cf_id: fromBinaryColumn(r.cf_id).toString('hex'),
+      field_id: r.field_id,
+      field_name: r.field_name,
+      field_kind: r.field_kind,
+      schema_type: r.schema_type,
+      store_values: !!Number(r.store_values),
+      writable: r.writable == null ? null : !!Number(r.writable),
+      materiality: r.materiality
+    }));
+    return withAlwaysControlled(declared);
+  });
+}
+
+export async function deleteControlledField({ projectId, issueTypeId, fieldId }) {
+  await throwing(
+    'DELETE FROM va_controlled_field WHERE project_id = ? AND issue_type_id = ? AND field_id = ?',
+    [projectId, issueTypeId, fieldId]
+  );
+}
+
+/**
+ * Read all declared field rows for this scope, including EXCLUDED rows.
+ *
+ * controlledFields() returns ACTIVE rows for capture, drift and panel reads.
+ * Writers and the admin candidateFields override map also need EXCLUDED rows.
+ * Previously, an excluded field reappeared as available on the next render
+ * because that map used controlledFields(). Seeding also needs these rows to
+ * avoid re-enabling fields an administrator excluded.
+ */
+export async function declaredFieldRows({ projectId, issueTypeId }) {
+  const rows = await throwing(
+    `SELECT TO_BASE64(cf_id) AS cf_id, field_id, field_name, field_kind, schema_type,
+            store_values, writable, materiality, state, issue_type_id
+     FROM va_controlled_field
+     WHERE project_id = ?
+       AND (issue_type_id = ? OR issue_type_id = '*')
+     ORDER BY issue_type_id DESC`,
+    [projectId, issueTypeId]
+  );
+  const byField = new Map();
+  for (const r of rows) if (!byField.has(r.field_id)) byField.set(r.field_id, r);
+  return [...byField.values()].map((r) => ({
+    cf_id: fromBinaryColumn(r.cf_id).toString('hex'),
+    field_id: r.field_id,
+    field_name: r.field_name,
+    field_kind: r.field_kind,
+    schema_type: r.schema_type,
+    store_values: !!Number(r.store_values),
+    writable: r.writable == null ? null : !!Number(r.writable),
+    materiality: r.materiality,
+    state: r.state,
+    issue_type_id: r.issue_type_id
+  }));
+}
+
+/**
+ * Insert ACTIVE rows for fields without an existing row and return the count.
+ * Keep existing rows unchanged, including EXCLUDED rows and administrator-set
+ * materiality or retention. Rerunning the seed adds no duplicate rows.
+ *
+ * Forge SQL permits one statement per call without a surrounding transaction.
+ * A 300-field insert risks the payload limit as one statement, while 300 calls
+ * can time out. Batches of 40 need eight statements for 300 fields. Completed
+ * batches remain if a later batch fails; a retry inserts the remaining fields.
+ */
+export async function seedControlledFields({ projectId, issueTypeId, fields, accountId, now }) {
+  if (!Array.isArray(fields) || fields.length === 0) return { inserted: 0 };
+
+  const CHUNK = 40;
+  let inserted = 0;
+
+  for (let i = 0; i < fields.length; i += CHUNK) {
+    const chunk = fields.slice(i, i + CHUNK);
+    const params = [];
+    const tuples = [];
+
+    for (const f of chunk) {
+      tuples.push('(FROM_BASE64(?), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
+      params.push(
+        toBinaryParam(newId()), projectId, issueTypeId,
+        String(f.field_id), String(f.field_name ?? f.field_id), String(f.field_kind),
+        f.schema_type ?? null,
+        f.store_values === true ? 1 : 0,
+        f.writable == null ? null : (f.writable ? 1 : 0),
+        String(f.materiality ?? 'MINOR'),
+        ACTIVE, now, accountId
+      );
+    }
+
+    await throwing(
+      `INSERT INTO va_controlled_field
+       (cf_id, project_id, issue_type_id, field_id, field_name, field_kind, schema_type,
+        store_values, writable, materiality, state, created_at, created_by)
+       VALUES ${tuples.join(', ')}`,
+      params
+    );
+    inserted += chunk.length;
+  }
+
+  return { inserted };
+}
+
+/**
+ * How many fields this project tracks, across every issue type.
+ *
+ * The backfill's trigger condition. Cheap enough to ask every hour for every
+ * gated project, and served by idx_cf_lookup.
+ */
+export async function countControlledFields({ projectId }) {
+  const rows = await throwing(
+    'SELECT COUNT(*) AS n FROM va_controlled_field WHERE project_id = ? AND state = ?',
+    [projectId, ACTIVE]
+  );
+  return Number(rows?.[0]?.n ?? 0);
+}
+
+/**
+ * Update an existing field row by looking up its cf_id before REPLACE INTO.
+ * The primary key is cf_id; no unique key covers
+ * (project_id, issue_type_id, field_id). Previously, a new cf_id always inserted
+ * a row. Exclude, Track, Exclude could leave three rows, making the first-wins
+ * Map in controlledFields() depend on query order.
+ *
+ * Use the newest matching row and remove older duplicates. A unique index
+ * would need duplicate cleanup before it could be added safely.
+ */
+export async function upsertControlledField(row) {
+  let id = row.cf_id ?? null;
+
+  if (!id) {
+    const existing = await throwing(
+      `SELECT TO_BASE64(cf_id) AS cf_id FROM va_controlled_field
+       WHERE project_id = ? AND issue_type_id = ? AND field_id = ?
+       ORDER BY created_at DESC`,
+      [row.project_id, row.issue_type_id, row.field_id]
+    );
+    if (existing.length > 0) id = fromBinaryColumn(existing[0].cf_id);
+
+    // Any older duplicates this field accumulated before the lookup existed.
+    // Removed here rather than in a migration because a DELETE is not DDL and
+    // the migration runner only executes DDL.
+    if (existing.length > 1) {
+      await throwing(
+        `DELETE FROM va_controlled_field
+         WHERE project_id = ? AND issue_type_id = ? AND field_id = ? AND cf_id <> FROM_BASE64(?)`,
+        [row.project_id, row.issue_type_id, row.field_id, toBinaryParam(id)]
+      );
+    }
+  }
+
+  if (!id) id = newId();
+  await throwing(
+    `REPLACE INTO va_controlled_field
+     (cf_id, project_id, issue_type_id, field_id, field_name, field_kind, schema_type,
+      store_values, writable, materiality, state, created_at, created_by)
+     VALUES (FROM_BASE64(?), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      toBinaryParam(id), row.project_id, row.issue_type_id, row.field_id, row.field_name,
+      row.field_kind, row.schema_type ?? null,
+      row.store_values ? 1 : 0,
+      row.writable == null ? null : (row.writable ? 1 : 0),
+      row.materiality ?? 'MINOR',
+      row.state ?? ACTIVE, row.created_at, row.created_by
+    ]
+  );
+  return id;
+}
+
+/**
+ * Turn value retention on or off for one field.
+ *
+ * Its own function rather than a generic update, because this is the single
+ * most consequential setting in the app and every call site must audit it. The
+ * resolver that calls this writes FIELD_RETENTION_CHANGED to the ledger; that
+ * pairing is the only reason storing values at all is defensible.
+ *
+ * Turning retention OFF deletes nothing already stored. That is deliberate: the
+ * stored values belong to baselines a reviewer may still be looking at, and
+ * silently voiding them would break a diff mid-review. The daily prune removes
+ * them as those baselines are superseded, and the admin screen says so.
+ */
+export async function setFieldRetention({ projectId, issueTypeId, fieldId, storeValues }) {
+  const result = await executeQuery(
+    `UPDATE va_controlled_field SET store_values = ?
+     WHERE project_id = ? AND issue_type_id = ? AND field_id = ?`,
+    [storeValues ? 1 : 0, projectId, issueTypeId, fieldId]
+  );
+  return result.result;
+}
+
+// ── va_eligibility ──────────────────────────────────────────────────────────────
+
+export async function listReviewers({ projectId = null } = {}) {
+  const scope = projectId == null ? 'WHERE state = ?' : 'WHERE (project_id = ? OR project_id IS NULL) AND state = ?';
+  const params = projectId == null ? [ACTIVE] : [projectId, ACTIVE];
+  const rows = await throwing(
+    `SELECT TO_BASE64(el_id) AS el_id, account_id, display_name, issue_type_id, project_id,
+            role, state, granted_at, granted_by
+     FROM va_eligibility ${scope}
+     ORDER BY granted_at DESC LIMIT ${limitClause(500)}`,
+    params
+  );
+  return rows.map((r) => ({ ...r, el_id: fromBinaryColumn(r.el_id).toString('hex') }));
+}
+
+export async function upsertReviewer(row) {
+  const id = row.el_id ?? newId();
+  await throwing(
+    `REPLACE INTO va_eligibility
+     (el_id, account_id, display_name, issue_type_id, project_id, role, state, granted_at, granted_by)
+     VALUES (FROM_BASE64(?), ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      toBinaryParam(id), row.account_id, row.display_name, row.issue_type_id,
+      row.project_id == null ? null : row.project_id,
+      row.role, row.state ?? ACTIVE, row.granted_at, row.granted_by
+    ]
+  );
+  return id;
+}
+
+export async function revokeReviewer(rvId) {
+  await executeQuery(
+    `UPDATE va_eligibility SET state = 'REVOKED' WHERE el_id = FROM_BASE64(?)`,
+    [toBinaryParam(rvId)]
+  );
+}

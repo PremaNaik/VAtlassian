@@ -1,0 +1,263 @@
+import { identityRecords, vaultedAttachmentMedia } from '../db/vaultStore.js';
+
+/**
+ * Map restored attachments to their approved identities.
+ *
+ * Jira never changes an attachment in place, so its ID identifies the original
+ * file. Re-uploading vaulted bytes creates a new ID. After verifying the
+ * upload's SHA-256 against the vault, restore records the new-to-original
+ * mapping in va_attachment_alias. Comparison reads use the original ID; jiraId
+ * retains the live ID for downloads and deletes. Tree restore uses the same
+ * approach for recreated work items.
+ *
+ * ADF inline images reference media IDs rather than Jira attachment IDs. A
+ * 2026-09-24 probe of VAT-3 found attachment 12085 represented only by media ID
+ * 5786f451-…, with no filename or Jira ID. Restore records media aliases too,
+ * so ADF comparisons map restored pointers back to their approved IDs. The
+ * ledger records the replacement while Jira keeps the live pointer.
+ *
+ * If the alias table cannot be read, comparison uses the new ID and reports
+ * drift. This may report a restored file as changed, but cannot hide a change.
+ */
+
+/** Only what a comparison or a restore needs; the URLs Jira adds are dropped. */
+function entry(attachment, aliases) {
+  if (attachment?.jiraId != null) return attachment;
+  const jiraId = String(attachment?.id ?? '');
+  return {
+    id: aliases?.get(jiraId) ?? jiraId,
+    jiraId,
+    filename: attachment?.filename ?? '',
+    size: attachment?.size ?? null,
+    mimeType: attachment?.mimeType ?? null,
+    created: attachment?.created ?? null,
+    author: attachment?.author?.accountId
+      ? { accountId: attachment.author.accountId, displayName: attachment.author.displayName ?? null }
+      : null,
+    isRichText: Boolean(attachment?.isRichText),
+    mediaId: attachment?.mediaId ?? null
+  };
+}
+
+/** Pure. `aliases`: Map(Jira id -> original id) for this one work item. */
+export function canonicalAttachments(list, aliases = null) {
+  return Array.isArray(list) ? list.map(a => entry(a, aliases)) : list;
+}
+
+/** The real Jira id of an attachment read through canonicalAttachments (or not). */
+export const jiraIdOf = attachment => String(attachment?.jiraId ?? attachment?.id ?? '');
+
+const hasAttachments = fields => Array.isArray(fields?.attachment) && fields.attachment.length > 0;
+const isAdfDoc = value => value && typeof value === 'object' && !Array.isArray(value) && value.type === 'doc';
+
+/** Every media id an ADF value points at. Pure. */
+export function adfMediaIds(value, found = []) {
+  if (!value || typeof value !== 'object') return found;
+  if (Array.isArray(value)) { for (const item of value) adfMediaIds(item, found); return found; }
+  if ((value.type === 'media' || value.type === 'mediaInline') && value.attrs?.id) found.push(String(value.attrs.id));
+  for (const child of value.content ?? []) adfMediaIds(child, found);
+  return found;
+}
+
+/**
+ * A copy of `value` with each media pointer in `map` (id -> id) replaced, and
+ * nothing else touched. Returns `value` itself when nothing maps. Pure.
+ */
+export function rewriteAdfMedia(value, map) {
+  if (!map?.size || !value || typeof value !== 'object') return value;
+  if (Array.isArray(value)) {
+    let changed = false;
+    const out = value.map(item => { const next = rewriteAdfMedia(item, map); if (next !== item) changed = true; return next; });
+    return changed ? out : value;
+  }
+  let out = value;
+  const id = value.attrs?.id == null ? null : String(value.attrs.id);
+  if ((value.type === 'media' || value.type === 'mediaInline') && id && map.has(id)) {
+    out = { ...value, attrs: { ...value.attrs, id: map.get(id) } };
+  }
+  if (Array.isArray(value.content)) {
+    const content = rewriteAdfMedia(value.content, map);
+    if (content !== value.content) out = { ...out, content };
+  }
+  return out;
+}
+
+/**
+ * original media id -> the media id rich text should show it by now: the
+ * NEWEST restored copy still on the item. `record` is one work item's
+ * identityRecords() entry, oldest first; a copy whose Jira id is not in
+ * `liveJiraIds` (deleted since it was restored) is passed over. Without
+ * `liveJiraIds`, or for a copy whose owner was never recorded, every copy
+ * counts as live and the newest wins. Pure.
+ */
+export function liveCopyMedia(record, liveJiraIds = null) {
+  const forward = new Map();
+  for (const [copy, original] of record?.media ?? new Map()) {
+    const owner = record?.mediaOwner?.get(copy);
+    if (liveJiraIds && owner != null && !liveJiraIds.has(String(owner))) continue;
+    forward.set(original, copy);
+  }
+  return forward;
+}
+
+/**
+ * Find media pointers to known files that are no longer on the work item.
+ * fields contains Jira's live pointers, before canonicalisation. Check only
+ * restored files and their originals; ordinary digest comparison covers other
+ * pointers, including images from another item.
+ *
+ * Canonicalisation gives the deleted original and its restored copy the same
+ * digest. This separate check detects when the live pointer still references
+ * the missing file and therefore renders a broken image. This function is pure.
+ */
+export function danglingMediaPointers(fields, record, liveJiraIds) {
+  if (!record?.media?.size || !liveJiraIds) return [];
+  const jiraIdOfMedia = new Map();
+  for (const [copy, original] of record.media) {
+    const owner = record.mediaOwner?.get(copy);
+    if (owner == null) continue;
+    jiraIdOfMedia.set(copy, String(owner));
+    const originalJiraId = record.files?.get(String(owner));
+    if (originalJiraId != null && !jiraIdOfMedia.has(original)) jiraIdOfMedia.set(original, String(originalJiraId));
+  }
+  const dangling = [];
+  for (const [fieldId, value] of Object.entries(fields ?? {})) {
+    if (!isAdfDoc(value)) continue;
+    for (const mediaId of adfMediaIds(value)) {
+      const jiraId = jiraIdOfMedia.get(mediaId);
+      if (jiraId != null && !liveJiraIds.has(jiraId)) dangling.push({ fieldId, mediaId, jiraId });
+    }
+  }
+  return dangling;
+}
+
+async function recordsFor(issueIds, read) {
+  if (issueIds.length === 0) return new Map();
+  try {
+    const records = await read(issueIds);
+    if (read === identityRecords) {
+      try {
+        const vaulted = await vaultedAttachmentMedia(issueIds);
+        for (const [issueId, mediaMap] of vaulted) {
+          if (!records.has(issueId)) records.set(issueId, { files: new Map(), media: new Map(), mediaOwner: new Map(), attachmentMedia: new Map() });
+          const entry = records.get(issueId);
+          if (entry.attachmentMedia) {
+            for (const [jId, mId] of mediaMap) {
+              if (!entry.attachmentMedia.has(jId)) entry.attachmentMedia.set(jId, mId);
+            }
+          }
+        }
+      } catch {
+        // non-fatal
+      }
+    }
+    return records;
+  } catch (error) {
+    console.error('attachmentIdentity: aliases unavailable; restored copies will read as changed', error);
+    return new Map();
+  }
+}
+
+async function defaultMediaIdOf(attachmentId) {
+  try {
+    const forge = await import('@forge/api');
+    const api = forge.default ?? forge;
+    const { route } = forge;
+    const { readMediaId } = await import('./mediaIdentity.js');
+    return await readMediaId({ api, route, attachmentId });
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Canonicalise the attachments of work items as read from Jira, in place: the
+ * attachment list, and every media pointer in their rich-text fields.
+ * `items`: objects with `id` and `fields` (an issue, or a tree node). One
+ * lookup for all of them, and none at all when no item has an attachment.
+ * Never throws.
+ */
+export async function canonicaliseItems(items, { read = identityRecords, mediaIdOf = null } = {}) {
+  const list = (items ?? []).filter(item => item && hasAttachments(item.fields));
+  const byIssue = await recordsFor([...new Set(list.map(item => Number(item.id)))], read);
+  const resolveMedia = mediaIdOf ?? defaultMediaIdOf;
+  for (const item of list) {
+    const record = byIssue.get(Number(item.id));
+    const files = record instanceof Map ? record : record?.files ?? null;
+    const media = record instanceof Map ? null : record?.media ?? null;
+    const mediaOwner = record instanceof Map ? null : record?.mediaOwner ?? null;
+    const attachmentMedia = record instanceof Map ? null : record?.attachmentMedia ?? null;
+
+    const richTextMedia = new Set();
+    for (const [fieldId, value] of Object.entries(item.fields ?? {})) {
+      if (isAdfDoc(value)) {
+        for (const mId of adfMediaIds(value)) richTextMedia.add(String(mId));
+      }
+    }
+
+    if (Array.isArray(item.fields.attachment)) {
+      for (const a of item.fields.attachment) {
+        const jId = String(a?.jiraId ?? a?.id ?? '');
+        let aMediaId = a?.mediaId ?? attachmentMedia?.get(jId) ?? null;
+        if (!aMediaId && richTextMedia.size > 0 && typeof resolveMedia === 'function') {
+          try {
+            aMediaId = await resolveMedia(jId);
+          } catch {
+            aMediaId = null;
+          }
+          if (aMediaId) {
+            if (attachmentMedia) attachmentMedia.set(jId, aMediaId);
+            if (mediaOwner) mediaOwner.set(aMediaId, jId);
+          }
+        }
+        const canonMediaId = media?.get(aMediaId) ?? aMediaId;
+        if (canonMediaId) a.mediaId = canonMediaId;
+        const isRich = Boolean(
+          a?.isRichText ||
+          (aMediaId && richTextMedia.has(String(aMediaId))) ||
+          (canonMediaId && richTextMedia.has(String(canonMediaId))) ||
+          (mediaOwner && [...richTextMedia].some(mId => mediaOwner.get(mId) === jId))
+        );
+        a.isRichText = isRich;
+      }
+    }
+
+    const fields = { ...item.fields, attachment: canonicalAttachments(item.fields.attachment, files) };
+    if (media?.size) {
+      for (const [fieldId, value] of Object.entries(fields)) {
+        if (isAdfDoc(value)) fields[fieldId] = rewriteAdfMedia(value, media);
+      }
+    }
+    item.fields = fields;
+  }
+  return items;
+}
+
+/** One issue, as read from Jira. Returns the same issue. Never throws. */
+export async function canonicaliseIssue(issue, options = {}) {
+  if (issue) await canonicaliseItems([issue], options);
+  return issue;
+}
+
+/**
+ * Read the files recorded by a baseline from retained values and tracked
+ * fields. Return [{ id, jiraId, filename }], or null when no tracked field holds
+ * attachments. The vault copies this signed set, never the issue's later files.
+ */
+export function recordedAttachments(values, fields) {
+  const ids = (fields ?? []).filter(f => f.field_kind === 'ATTACHMENTS').map(f => f.field_id);
+  const seen = new Map();
+  for (const fieldId of ids) {
+    for (const a of Array.isArray(values?.[fieldId]) ? values[fieldId] : []) {
+      const id = String(a?.id ?? '');
+      if (id && !seen.has(id)) seen.set(id, { id, jiraId: jiraIdOf(a), filename: a?.filename ?? '' });
+    }
+  }
+  const allAtts = Array.isArray(values?.allAttachments) ? values.allAttachments
+    : (Array.isArray(values?.attachment) ? values.attachment : []);
+  for (const a of allAtts) {
+    const id = String(a?.id ?? '');
+    if (id && !seen.has(id)) seen.set(id, { id, jiraId: jiraIdOf(a), filename: a?.filename ?? '' });
+  }
+  return seen.size > 0 ? [...seen.values()] : (ids.length > 0 ? [] : null);
+}

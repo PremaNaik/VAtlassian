@@ -1,0 +1,302 @@
+import { entryHash, GENESIS_HASH, canonical } from './hash.js';
+import { FailClosed } from './errors.js';
+
+export const MAX_APPEND_ATTEMPTS = 128;  // above any realistic burst; the deadline is the real bound
+export const APPEND_DEADLINE_MS = 3_000;
+
+/**
+ * Append entries to the audit hash chain without transactions.
+ *
+ * An append reads the tail hash and inserts the next sequence. Forge SQL permits
+ * one statement per call and has no BEGIN/COMMIT. The seq primary key serializes
+ * concurrent appends: one atomic INSERT succeeds and competing inserts receive
+ * a duplicate-key error instead of creating two entries at the same sequence.
+ *
+ * On collision, read the winning row at sequence N, use its hash as prev_hash
+ * and try N+1. Re-reading the tail on every collision previously made competing
+ * writers collide repeatedly; at 40 concurrent appends, some exhausted retries.
+ * Following the winning row advances one sequence per retry. With N concurrent
+ * writers, the last writer needs at most N attempts under this contention model.
+ *
+ * Limit both attempts and elapsed time because callers may include a workflow
+ * validator. If audit recording exhausts its budget, refuse the action rather
+ * than allow an unrecorded signature.
+ */
+export async function append(store, event, { now = Date.now, sleep = defaultSleep, deadlineMs = APPEND_DEADLINE_MS } = {}) {
+  const deadline = now() + deadlineMs;
+  let lastError;
+
+  const tail = await store.readTail();
+  let seq = tail ? tail.seq + 1 : 1;
+  let prevHash = tail ? tail.entry_hash : GENESIS_HASH;
+
+  for (let attempt = 0; attempt < MAX_APPEND_ATTEMPTS; attempt++) {
+    if (now() > deadline) break;
+
+    const occurredAt = event.occurredAt ?? now();
+    const payload = event.payload ?? {};
+    const row = {
+      seq,
+      event_id: event.eventId,
+      occurred_at: occurredAt,
+      actor_account_id: event.actorAccountId,
+      event_type: event.eventType,
+      issue_id: event.issueId ?? null,
+      approval_id: event.approvalId ?? null,
+      payload: canonical(payload),
+      prev_hash: prevHash
+    };
+    row.entry_hash = entryHash({
+      seq,
+      prevHash,
+      occurredAt,
+      actorAccountId: row.actor_account_id,
+      eventType: row.event_type,
+      issueId: row.issue_id,
+      approvalId: row.approval_id,
+      payload
+    });
+
+    try {
+      await store.insertEntry(row);
+      return { seq, entryHash: row.entry_hash, attempts: attempt + 1 };
+    } catch (err) {
+      if (!store.isDuplicateKey(err)) {
+        throw new FailClosed('LEDGER_UNAVAILABLE', err);
+      }
+      lastError = err;
+
+      // Someone took our slot. Chain onto THEIR entry and advance by one.
+      const taken = await store.entryAt(seq);
+      if (taken) {
+        prevHash = taken.entry_hash;
+        seq = seq + 1;
+      } else {
+        // Should not happen (the duplicate proves a row exists), but if the
+        // read races a prune, resync from the tail rather than guessing.
+        const t = await store.readTail();
+        seq = t ? t.seq + 1 : 1;
+        prevHash = t ? t.entry_hash : GENESIS_HASH;
+      }
+
+      // Small jittered pause. Without jitter, contending writers advance in
+      // lockstep and keep colliding.
+      await sleep(Math.floor(Math.random() * 3));
+    }
+  }
+  throw new FailClosed('LEDGER_UNAVAILABLE', lastError);
+}
+
+const defaultSleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Walk the audit chain and report the first break under 21 CFR 11.10(a).
+ * This detects invalid or altered records; it cannot prevent tampering.
+ * Run daily and on demand from the admin console.
+ *
+ * maxEntries bounds one call. A bounded window returns partial: true and nextSeq
+ * for resumption. That verdict covers only the window; a result without partial
+ * has reached the tail. See jobs/verify.js for multi-run verification limits.
+ */
+export async function verifyChain(store, { from = 1, batchSize = 500, maxEntries = Infinity } = {}) {
+  let expectedSeq = from;
+  let prevHash = from === 1 ? GENESIS_HASH : await store.entryHashAt(from - 1);
+  if (prevHash == null) {
+    return { ok: false, brokenAt: from, reason: 'MISSING_PREDECESSOR' };
+  }
+
+  let checked = 0;
+  for (;;) {
+    const remaining = maxEntries - checked;
+    if (remaining <= 0) {
+      return { ok: true, partial: true, checked, nextSeq: expectedSeq, terminalHash: prevHash };
+    }
+    const batch = await store.readRange(expectedSeq, Math.min(batchSize, remaining));
+    if (batch.length === 0) break;
+
+    for (const row of batch) {
+      if (row.seq !== expectedSeq) {
+        return { ok: false, brokenAt: expectedSeq, reason: 'SEQUENCE_GAP', found: row.seq, checked };
+      }
+      if (row.prev_hash !== prevHash) {
+        return { ok: false, brokenAt: row.seq, reason: 'CHAIN_MISMATCH', checked };
+      }
+      const recomputed = entryHash({
+        seq: row.seq,
+        prevHash: row.prev_hash,
+        occurredAt: row.occurred_at,
+        actorAccountId: row.actor_account_id,
+        eventType: row.event_type,
+        issueId: row.issue_id,
+        approvalId: row.approval_id,
+        payload: JSON.parse(row.payload)
+      });
+      if (recomputed !== row.entry_hash) {
+        return { ok: false, brokenAt: row.seq, reason: 'ENTRY_ALTERED', checked };
+      }
+      prevHash = row.entry_hash;
+      expectedSeq += 1;
+      checked += 1;
+    }
+  }
+  return { ok: true, checked, terminalSeq: expectedSeq - 1, terminalHash: prevHash };
+}
+
+export const EVENT = {
+  // 2026-08-18: TOTP replaced the PIN as the second identification component.
+  TOTP_ENROLLED: 'TOTP_ENROLLED',
+  TOTP_CONFIRMED: 'TOTP_CONFIRMED',
+  TOTP_RESET: 'TOTP_RESET',
+  TOTP_ATTEMPT_FAILED: 'TOTP_ATTEMPT_FAILED',
+  TOTP_LOCKED_OUT: 'TOTP_LOCKED_OUT',
+  WEBAUTHN_CREDENTIAL_ENROLLED: 'WEBAUTHN_CREDENTIAL_ENROLLED',
+  WEBAUTHN_AUTH_FAILED: 'WEBAUTHN_AUTH_FAILED',
+  // An administrator reopened a person's biometric signing after the lockout
+  // in db/webauthnLockStore.js and revoked their registered devices.
+  WEBAUTHN_RESET: 'WEBAUTHN_RESET',
+  // Signed sprint start and completion (lib/sprintStart.js), and the
+  // detective record of a sprint started or closed without one
+  // (triggers/sprint-event.js).
+  SPRINT_START_SIGNED: 'SPRINT_START_SIGNED',
+  SPRINT_STARTED: 'SPRINT_STARTED',
+  SPRINT_START_FAILED: 'SPRINT_START_FAILED',
+  SPRINT_COMPLETE_SIGNED: 'SPRINT_COMPLETE_SIGNED',
+  SPRINT_COMPLETED: 'SPRINT_COMPLETED',
+  SPRINT_COMPLETE_FAILED: 'SPRINT_COMPLETE_FAILED',
+  SPRINT_STARTED_UNSIGNED: 'SPRINT_STARTED_UNSIGNED',
+  SPRINT_CLOSED_UNSIGNED: 'SPRINT_CLOSED_UNSIGNED',
+  CREDENTIAL_RESET_GRANT_ISSUED: 'CREDENTIAL_RESET_GRANT_ISSUED',
+  CREDENTIAL_RESET_GRANT_REDEEMED: 'CREDENTIAL_RESET_GRANT_REDEEMED',
+  SIGNATURE_CREATED: 'SIGNATURE_CREATED',
+  SIGNATURE_CONSUMED: 'SIGNATURE_CONSUMED',
+  SIGNATURE_VOIDED: 'SIGNATURE_VOIDED',
+  // 2026-08-18: record the eligible reviewer's explicit refusal in panel:reject.
+  // Keep it separate from TRANSITION_DENIED, which records the gate's refusal of
+  // an unauthorized or invalid attempt.
+  SIGNATURE_DECLINED: 'SIGNATURE_DECLINED',
+  CONTENT_CHANGED: 'CONTENT_CHANGED',
+  ITEM_FIRST_OBSERVED: 'ITEM_FIRST_OBSERVED',
+  // 2026-08-26: the item left the status its baseline was signed into, so that
+  // signature stopped describing the record and drift detection disarmed.
+  // That path is gone (drift holds, it never disarms); this is now written only
+  // when a baselined work item is deleted (triggers/issue-deleted.js), and
+  // older ledgers may still carry the re-entry form.
+  //
+  // Audited rather than silent because it is a change in the CONTROL that
+  // applies to a record, not a change to the record. Every other event here
+  // answers "what happened to this document"; this one answers "why did this
+  // app stop watching it", and an auditor who finds an item that quietly
+  // ceased to be tracked deserves better than an absence. Nothing is destroyed
+  // by it: va_signature and the Electronic Signature field both still hold the
+  // signature it supersedes.
+  BASELINE_SUPERSEDED: 'BASELINE_SUPERSEDED',
+  SIGNATURE_EXPIRED: 'SIGNATURE_EXPIRED',
+  TRANSITION_DENIED: 'TRANSITION_DENIED',
+  ADMIN_SEEDED: 'ADMIN_SEEDED',
+  ELIGIBILITY_CHANGED: 'ELIGIBILITY_CHANGED',
+  CONTROLLED_TRANSITION_CHANGED: 'CONTROLLED_TRANSITION_CHANGED',
+  SEGMENT_SEALED: 'SEGMENT_SEALED',
+  // 2026-08-31: record an administrator's export under 21 CFR 11.10(b), including
+  // who exported which range, when and its SHA-256. SEGMENT_SEALED instead records
+  // archival sealing and must remain a distinct event.
+  RECORDS_EXPORTED: 'RECORDS_EXPORTED',
+  CHAIN_VERIFIED: 'CHAIN_VERIFIED',
+  CHAIN_BROKEN: 'CHAIN_BROKEN',
+  // 2026-08-31: record gatecheck findings for missing, disabled or orphaned
+  // validators and additional ungated routes. A removed validator cannot report
+  // its own absence because Jira stops invoking it. These dated findings record
+  // when scheduled checks discovered the enforcement gap.
+  GATE_DRIFT_DETECTED: 'GATE_DRIFT_DETECTED',
+  // The same finding stopped being observed. Recorded, not deleted: a window
+  // in which a control was absent remains a fact about the record even after
+  // someone reattaches the validator.
+  GATE_DRIFT_CLEARED: 'GATE_DRIFT_CLEARED',
+  // 2026-08-31: record successful TOTP device tests, overdue checks and use after
+  // dormancy under 21 CFR 11.300(e). A valid code proves the shared secret and
+  // accepted clock window. DORMANT_DEVICE_USED records inactivity duration for
+  // investigation; it cannot distinguish a returning owner from a copied secret.
+  DEVICE_CHECK_PASSED: 'DEVICE_CHECK_PASSED',
+  DEVICE_CHECK_DUE: 'DEVICE_CHECK_DUE',
+  DORMANT_DEVICE_USED: 'DORMANT_DEVICE_USED',
+  // Item 3: admin review of an intercepted content change.
+  CHANGE_APPROVED: 'CHANGE_APPROVED',
+  CHANGE_REJECTED: 'CHANGE_REJECTED',
+  BASELINE_CAPTURED: 'BASELINE_CAPTURED',
+  // No longer written; kept so older ledger entries still have a name.
+  BASELINE_DISARMED: 'BASELINE_DISARMED',
+  BASELINE_DEGRADED: 'BASELINE_DEGRADED',
+  // A baselined work item was moved to another project or issue type in Jira.
+  // From then on it follows the destination's configuration (its tracked
+  // fields, or none); this entry is the record that it left the scope it was
+  // signed in. See lib/scopeMove.js.
+  BASELINE_SCOPE_CHANGED: 'BASELINE_SCOPE_CHANGED',
+  // An approval decided a link this work item shares, and its record could not
+  // take the decision: its links were not retained, or it stayed busy with its
+  // own decision past every retry. See jobs/linkWorker.js.
+  LINK_DECISION_NOT_RECORDED: 'LINK_DECISION_NOT_RECORDED',
+  DRIFT_DETECTED: 'DRIFT_DETECTED',
+  DRIFT_RECONCILED: 'DRIFT_RECONCILED',
+  DRIFT_SELF_REVERTED: 'DRIFT_SELF_REVERTED',
+  DRIFT_RECALLED: 'DRIFT_RECALLED',
+  // 2026-09-13: payload.reason records NOT_GATED, NO_ROUTE, AMBIGUOUS_ROUTE,
+  // SCREEN_BLOCKED, JIRA_REFUSED or BASELINE_POLICY_INCOMPLETE. See lib/recall.js
+  // and lib/restore/recall.js#recordRecallFailure. db/incidentStore.js also creates
+  // a deduplicated finding for admin action; this entry remains the issue's
+  // permanent failure record.
+  DRIFT_RECALL_FAILED: 'DRIFT_RECALL_FAILED',
+  DECISION_RECORDED: 'DECISION_RECORDED',
+  DECISION_CONSUMED: 'DECISION_CONSUMED',
+  DECISION_VOIDED: 'DECISION_VOIDED',
+  DECISION_EXPIRED: 'DECISION_EXPIRED',
+  RESTORE_STARTED: 'RESTORE_STARTED',
+  RESTORE_COMPLETED: 'RESTORE_COMPLETED',
+  RESTORE_PARTIAL: 'RESTORE_PARTIAL',
+  RESTORE_FAILED: 'RESTORE_FAILED',
+  TRANSITION_ALLOWED: 'TRANSITION_ALLOWED',
+  REPORT_GENERATED: 'REPORT_GENERATED',
+  REPORT_DEGRADED: 'REPORT_DEGRADED',
+  CONFIG_CHANGED: 'CONFIG_CHANGED',
+  REVIEWER_CHANGED: 'REVIEWER_CHANGED',
+  GATED_TRANSITION_CHANGED: 'GATED_TRANSITION_CHANGED',
+  FIELD_RETENTION_CHANGED: 'FIELD_RETENTION_CHANGED',
+  CONTROLLED_FIELDS_BASELINED: 'CONTROLLED_FIELDS_BASELINED',
+  APPROVAL_RECORDED: 'APPROVAL_RECORDED',
+  APPROVAL_CONSUMED: 'APPROVAL_CONSUMED',
+  APPROVAL_VOIDED: 'APPROVAL_VOIDED',
+  APPROVAL_REFUSED: 'APPROVAL_REFUSED',
+  TRANSITION_BLOCKED: 'TRANSITION_BLOCKED',
+  TRANSITION_COMPLETED: 'TRANSITION_COMPLETED',
+  TREE_RESTORE_PLAN_CREATED: 'TREE_RESTORE_PLAN_CREATED',
+  TREE_RESTORE_STEP_CLAIMED: 'TREE_RESTORE_STEP_CLAIMED',
+  TREE_RESTORE_REPLACEMENT_RECORDED: 'TREE_RESTORE_REPLACEMENT_RECORDED',
+  // What a rejection destroyed, written before the work item is deleted. See
+  // the DELETE_ADDED_NODE branch of lib/tree/restoreExecutor.js: this entry IS
+  // the record that the deleted record existed.
+  TREE_RESTORE_NODE_DESTROYED: 'TREE_RESTORE_NODE_DESTROYED',
+  TREE_RESTORE_VERIFIED: 'TREE_RESTORE_VERIFIED',
+  VAULT_SPACE_CREATED: 'VAULT_SPACE_CREATED',
+  VAULT_SPACE_CREATE_FAILED: 'VAULT_SPACE_CREATE_FAILED',
+  VAULT_PROJECT_ADDED: 'VAULT_PROJECT_ADDED',
+  ATTACHMENT_DELETE_LOCKED: 'ATTACHMENT_DELETE_LOCKED',
+  ATTACHMENT_DELETE_LOCK_FAILED: 'ATTACHMENT_DELETE_LOCK_FAILED',
+  VAULT_QUEUE_FAILED: 'VAULT_QUEUE_FAILED',
+  ATTACHMENT_VAULTED: 'ATTACHMENT_VAULTED',
+  ATTACHMENT_VAULT_FAILED: 'ATTACHMENT_VAULT_FAILED',
+  // A rejection re-uploaded a vaulted file: the original id, the new id that
+  // now stands for it, and the hash both carry. See lib/restore/attachments.js.
+  ATTACHMENT_RESTORED: 'ATTACHMENT_RESTORED',
+  // What a rejection deleted, with the hash of its bytes, written BEFORE the
+  // delete; like TREE_RESTORE_NODE_DESTROYED, this entry is the record.
+  ATTACHMENT_REMOVED_BY_RESTORE: 'ATTACHMENT_REMOVED_BY_RESTORE',
+  // The app's own account was granted Delete all attachments on a locked
+  // project's scheme, so a rejection can remove a file added after approval.
+  ATTACHMENT_DELETE_GRANTED_TO_APP: 'ATTACHMENT_DELETE_GRANTED_TO_APP',
+  ATTACHMENT_DELETE_GRANT_FAILED: 'ATTACHMENT_DELETE_GRANT_FAILED',
+  // An administrator turned the project's attachment-delete lockdown off. The
+  // grants it removed are NOT put back (grantsRestored: false): which holders
+  // had them is in the ATTACHMENT_DELETE_LOCKED entry, for a person to re-add.
+  ATTACHMENT_DELETE_LOCK_DISABLED: 'ATTACHMENT_DELETE_LOCK_DISABLED',
+  // Legacy audit event: where this site's vault was originally recorded (CONFLUENCE, or OBJECT_STORE).
+  // Kept for audit trail history.
+  VAULT_TIER_DETECTED: 'VAULT_TIER_DETECTED'
+};

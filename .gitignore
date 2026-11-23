@@ -1,0 +1,21 @@
+node_modules/
+frontend/node_modules/
+frontend/dist/
+.env*
+!.env.example
+.DS_Store
+*.log
+
+# Forge CLI working state. `.container-service-assets/local-account` holds a
+# live signed tunnel token — it is a credential and must never be committed.
+.forge/
+.container-service-assets/
+
+# Requirements setup: inspection reports and created-object state (site data).
+scripts/requirements-setup/.out/
+.claude/
+.scratch/
+docs/acceptance/live-fixtures/
+docs/acceptance/qa-handover-2026-10-30/
+docs/acceptance/governed-verification-qa-2026-11-02/governed-verification-qa.zip
+**/live-readback.json

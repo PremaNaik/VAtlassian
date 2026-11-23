@@ -1,0 +1,48 @@
+import { archive } from '../db/itemStateStore.js';
+import { tryAppend } from '../db/store.js';
+import { EVENT } from '../lib/ledger.js';
+import { collectAffectedTrees, affectedTreeRoots, collectTree } from '../lib/collect.js';
+import { withRequestCache } from '../lib/cache.js';
+import { retryEvent } from './retry.js';
+
+/**
+ * Handle avi:jira:deleted:issue by collecting affected trees before archiving
+ * the item. Read tree membership from the baseline node index. archive() only
+ * changes this item's va_item_state row, which affectedTreeRoots() does not use,
+ * but sequential execution avoids an unnecessary race.
+ */
+export async function run(event, suppliedDeps = null) {
+  return withRequestCache(() => runUncached(event, suppliedDeps));
+}
+
+async function runUncached(event, suppliedDeps) {
+  const deps = typeof suppliedDeps?.collectAffectedTrees === 'function'
+    ? suppliedDeps
+    : { collectAffectedTrees, affectedTreeRoots, collectTree };
+  const issue = event?.issue;
+  if (!issue?.id) return;
+  const issueId = Number(issue.id);
+  const issueKey = String(issue.key ?? issueId);
+  const now = Date.now();
+
+  try {
+    const results = await deps.collectAffectedTrees(event, deps);
+    // One event can fan out to several governed roots; a failed collection on
+    // any of them must retry rather than be silently dropped by archiving anyway.
+    const failed = results.find(r => ['ERROR', 'UNREADABLE', 'BUSY'].includes(r.outcome));
+    if (failed) return retryEvent(event, failed.outcome);
+    await archive(issueId, now);
+
+    await tryAppend({
+      actorAccountId: event?.atlassianId ?? 'system',
+      eventType: EVENT.BASELINE_SUPERSEDED,
+      issueId,
+      payload: { reason: 'ISSUE_DELETED', issueKey, valuesPurged: false, historyRetained: true }
+    });
+
+    console.log('deleted: archived', JSON.stringify({ issueKey }));
+    return results[0] || { outcome: 'NO_CHANGE' };
+  } catch (e) {
+    console.error('deleted: handler failed', JSON.stringify({ issueKey }), e);
+  }
+}

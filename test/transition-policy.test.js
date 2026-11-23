@@ -1,0 +1,240 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { registerHooks } from 'node:module';
+
+/**
+ * Exact-transition binding against the SQL queries.
+ *
+ * Two Jira transitions can both move status 3 to status 5, for example
+ * "Approve" and "Approve (fast-track)". gatedTransition() and
+ * pendingApprovalFor() previously matched project/issueType/fromStatus/
+ * toStatus alone, so either transition could use a row or receipt for the
+ * other.
+ *
+ * These tests exercise the SQL in db/configStore.js and db/approvalStore.js.
+ * They replace only the Forge SQL transport, lib/db.js, with an in-memory
+ * table supporting the same wildcard columns, exact transition id, and
+ * ORDER BY / LIMIT 1 semantics.
+ */
+
+function sortDesc(rows, keys) {
+  return [...rows].sort((a, b) => {
+    for (const key of keys) {
+      const av = String(a[key]), bv = String(b[key]);
+      if (av !== bv) return av < bv ? 1 : -1;
+    }
+    return 0;
+  });
+}
+
+function fakeQuery(sql, params) {
+  const db = globalThis.vaTransitionPolicy;
+  if (sql.includes("UPDATE va_approval SET state = 'VOID'")) {
+    const [approvalId] = params;
+    const approval = db.approvals.find(row => row.approval_id === approvalId && row.state === 'PENDING');
+    if (approval) approval.state = 'VOID';
+    return { result: true, data: { affectedRows: approval ? 1 : 0 } };
+  }
+  if (sql.includes('FROM va_controlled_transition')) {
+    const [projectId, issueTypeId, fromStatusId, toStatusId, transitionId, state] = params;
+    const matches = sortDesc(db.controlledTransitions.filter((r) =>
+      String(r.project_id) === String(projectId) &&
+      (String(r.issue_type_id) === String(issueTypeId) || r.issue_type_id === '*') &&
+      (String(r.from_status_id) === String(fromStatusId) || r.from_status_id === '*') &&
+      (String(r.to_status_id) === String(toStatusId) || r.to_status_id === '*') &&
+      String(r.transition_id) === String(transitionId) &&
+      r.state === state
+    ), ['issue_type_id', 'from_status_id', 'to_status_id']);
+    return { result: true, data: matches.slice(0, 1) };
+  }
+  if (sql.includes('FROM va_approval')) {
+    if (sql.includes('approval_id = FROM_BASE64(?)') && !sql.includes('transition_id = ?')) {
+      const [issueId, fromStatusId, toStatusId, now, approvalId] = params;
+      const matches = db.approvals.filter(row => String(row.issue_id) === String(issueId)
+        && row.state === 'PENDING' && row.decision === 'APPROVE'
+        && String(row.from_status_id) === String(fromStatusId)
+        && String(row.to_status_id) === String(toStatusId)
+        && Number(row.expires_at) > Number(now)
+        && row.approval_id === Buffer.from(approvalId, 'base64').toString('base64'));
+      return { result: true, data: matches.slice(0, 1) };
+    }
+    if (sql.includes('baseline_id IS NULL')) {
+      const [issueId, accountId, fromStatusId, now] = params;
+      const matches = db.approvals.filter(row => String(row.issue_id) === String(issueId)
+        && row.state === 'PENDING' && row.decision === 'APPROVE' && row.baseline_id == null
+        && row.account_id === accountId && row.from_status_id === fromStatusId
+        && Number(row.expires_at) > Number(now));
+      return { result: true, data: matches.slice(0, 1) };
+    }
+    const [issueId, fromStatusId, toStatusId, transitionId, now, approvalIdB64] = params;
+    const matches = db.approvals
+      .filter((r) =>
+        String(r.issue_id) === String(issueId) &&
+        r.state === 'PENDING' && r.decision === 'APPROVE' &&
+        String(r.from_status_id) === String(fromStatusId) &&
+        String(r.to_status_id) === String(toStatusId) &&
+        String(r.transition_id) === String(transitionId) &&
+        Number(r.expires_at) > Number(now) &&
+        (approvalIdB64 == null || r.approval_id === approvalIdB64))
+      .sort((a, b) => Number(b.decided_at) - Number(a.decided_at));
+    return { result: true, data: matches.slice(0, 1) };
+  }
+  return { result: true, data: [] };
+}
+
+const hooks = registerHooks({
+  resolve(specifier, context, next) {
+    const resolved = specifier.startsWith('.') ? new URL(specifier, context.parentURL).pathname : specifier;
+    if (resolved.endsWith('/lib/db.js')) return { url: 'fixture:lib/db.js', shortCircuit: true };
+    return next(specifier, context);
+  },
+  load(url, context, next) {
+    if (url === 'fixture:lib/db.js') return { format: 'module', shortCircuit: true, source: `
+      export function toBinaryParam(buffer) { return buffer.toString('base64'); }
+      export function fromBinaryColumn(value) { return value == null ? null : Buffer.from(value, 'base64'); }
+      export function limitClause(count) {
+        if (!Number.isSafeInteger(count) || count <= 0) throw new TypeError('LIMIT must be a positive safe integer');
+        return String(count);
+      }
+      export function affectedRows(result) {
+        const count = result && result.data && result.data.affectedRows;
+        return typeof count === 'number' ? count : null;
+      }
+      export const isUnknownColumn = error => error?.code === 'ER_BAD_FIELD_ERROR';
+      export async function executeQuery(sql, params) { return globalThis.vaTransitionPolicy.query(sql, params); }
+    ` };
+    return next(url, context);
+  }
+});
+const { gatedTransition } = await import('../src/db/configStore.js');
+const { pendingApprovalFor, pendingApprovalByToken, pendingApprovalForActor, invalidateApproval } = await import('../src/db/approvalStore.js');
+const { exactAvailableTransition } = await import('../src/lib/transitions.js');
+hooks.deregister();
+
+function row(overrides = {}) {
+  return {
+    project_id: 1, issue_type_id: '10001', from_status_id: '3', to_status_id: '5',
+    required_role: 'reviewer', meaning: 'Approved', require_decision: 0, block_on_drift: 1,
+    required_assurance: 'ESIGNATURE', capture_baseline: 1, state: 'ACTIVE',
+    ...overrides
+  };
+}
+
+test('two transitions to the same status resolve by transition id', async () => {
+  globalThis.vaTransitionPolicy = {
+    controlledTransitions: [
+      row({ ct_id: 'AAA=', transition_id: '101', required_assurance: 'ESIGNATURE' }),
+      row({ ct_id: 'BBB=', transition_id: '102', required_assurance: 'BIOMETRIC' })
+    ],
+    approvals: [],
+    query: fakeQuery
+  };
+
+  const exact = await gatedTransition({
+    projectId: 1, issueTypeId: '10001', fromStatusId: '3',
+    toStatusId: '5', transitionId: '102'
+  });
+
+  assert.equal(exact.transition_id, '102');
+  assert.equal(exact.required_assurance, 'BIOMETRIC');
+});
+
+test('live Jira transition selection keeps sibling transitions distinct by exact id', () => {
+  const transitions = [
+    { id: '101', toStatusId: '5', isAvailable: true },
+    { id: '102', toStatusId: '5', isAvailable: true }
+  ];
+  assert.deepEqual(exactAvailableTransition(transitions, { transitionId: '102', toStatusId: '5' }), transitions[1]);
+  assert.equal(exactAvailableTransition(transitions, { transitionId: '999', toStatusId: '5' }), null);
+});
+
+test('the sibling transition id resolves its own, different policy', async () => {
+  globalThis.vaTransitionPolicy = {
+    controlledTransitions: [
+      row({ ct_id: 'AAA=', transition_id: '101', required_assurance: 'ESIGNATURE', meaning: 'Fast-track approve' }),
+      row({ ct_id: 'BBB=', transition_id: '102', required_assurance: 'BIOMETRIC', meaning: 'Approve' })
+    ],
+    approvals: [],
+    query: fakeQuery
+  };
+
+  const sibling = await gatedTransition({
+    projectId: 1, issueTypeId: '10001', fromStatusId: '3',
+    toStatusId: '5', transitionId: '101'
+  });
+
+  assert.equal(sibling.transition_id, '101');
+  assert.equal(sibling.required_assurance, 'ESIGNATURE');
+  assert.equal(sibling.meaning, 'Fast-track approve');
+});
+
+test('gatedTransition never queries and returns null without an exact transition id', async () => {
+  globalThis.vaTransitionPolicy = {
+    controlledTransitions: [row({ ct_id: 'AAA=', transition_id: '101' })],
+    approvals: [],
+    query: () => assert.fail('a missing transition id must never reach the database')
+  };
+
+  const result = await gatedTransition({ projectId: 1, issueTypeId: '10001', fromStatusId: '3', toStatusId: '5', transitionId: null });
+  assert.equal(result, null);
+});
+
+test('a pending approval signed for one transition is not returned for a sibling transition to the same status', async () => {
+  const signedForFastTrack = {
+    approval_id: Buffer.alloc(16, 1).toString('base64'), baseline_id: null,
+    issue_id: 10, issue_key: 'T-10', project_id: 1, issue_type_id: '10001',
+    decision: 'APPROVE', state: 'PENDING', from_status_id: '3', to_status_id: '5',
+    transition_id: '101', expires_at: 999999999999, decided_at: 100
+  };
+  globalThis.vaTransitionPolicy = { controlledTransitions: [], approvals: [signedForFastTrack], query: fakeQuery };
+
+  const forSibling = await pendingApprovalFor({ issueId: 10, fromStatusId: '3', toStatusId: '5', transitionId: '102', now: 0 });
+  assert.equal(forSibling, null);
+
+  const forItsOwnTransition = await pendingApprovalFor({ issueId: 10, fromStatusId: '3', toStatusId: '5', transitionId: '101', now: 0 });
+  assert.ok(forItsOwnTransition, 'the approval must still resolve for the transition it was actually signed for');
+  assert.equal(forItsOwnTransition.transition_id, '101');
+});
+
+test('pendingApprovalFor never queries and returns null without an exact transition id', async () => {
+  globalThis.vaTransitionPolicy = {
+    controlledTransitions: [],
+    approvals: [{ approval_id: Buffer.alloc(16, 1).toString('base64'), issue_id: 10, decision: 'APPROVE',
+      state: 'PENDING', from_status_id: '3', to_status_id: '5', transition_id: '101', expires_at: 999999999999, decided_at: 100 }],
+    query: () => assert.fail('a missing transition id must never reach the database')
+  };
+
+  const result = await pendingApprovalFor({ issueId: 10, fromStatusId: '3', toStatusId: '5', transitionId: null, now: 0 });
+  assert.equal(result, null);
+});
+
+test('a transition-screen capability resolves its exact pending approval without transition.id', async () => {
+  const approvalId = Buffer.alloc(16, 4);
+  const row = { approval_id: approvalId.toString('base64'), issue_id: 10, decision: 'APPROVE',
+    state: 'PENDING', from_status_id: '3', to_status_id: '5', transition_id: '101', expires_at: 999999999999, decided_at: 100 };
+  globalThis.vaTransitionPolicy = { controlledTransitions: [], approvals: [row], query: fakeQuery };
+
+  const result = await pendingApprovalByToken({ issueId: 10, fromStatusId: '3', toStatusId: '5', approvalId, now: 0 });
+
+  assert.equal(result.transition_id, '101');
+});
+
+test('panel retry lookup excludes approvals bound to an existing baseline', async () => {
+  const common = { issue_id: 10, issue_key: 'T-10', project_id: 1, issue_type_id: '10001',
+    account_id: 'actor', decision: 'APPROVE', state: 'PENDING', from_status_id: '3',
+    to_status_id: '5', transition_id: '101', expires_at: 999999999999, decided_at: 100 };
+  globalThis.vaTransitionPolicy = { controlledTransitions: [], approvals: [
+    { ...common, approval_id: Buffer.alloc(16, 1).toString('base64'), baseline_id: Buffer.alloc(16, 2).toString('base64') }
+  ], query: fakeQuery };
+  assert.equal(await pendingApprovalForActor({ issueId: 10, accountId: 'actor', fromStatusId: '3', now: 0 }), null);
+});
+
+test('Jira refusal invalidates only a still-pending approval capability', async () => {
+  const approvalId = Buffer.alloc(16, 3);
+  globalThis.vaTransitionPolicy = { controlledTransitions: [], approvals: [
+    { approval_id: approvalId.toString('base64'), state: 'PENDING' }
+  ], query: fakeQuery };
+  assert.equal(await invalidateApproval({ approvalId }), true);
+  assert.equal(globalThis.vaTransitionPolicy.approvals[0].state, 'VOID');
+  assert.equal(await invalidateApproval({ approvalId }), false);
+});
